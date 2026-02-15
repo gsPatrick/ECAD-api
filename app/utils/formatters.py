@@ -16,6 +16,7 @@ from app.config.settings import logger
 # Schema Mestre - colunas padrao de saida
 # ---------------------------------------------------------------------------
 
+
 MASTER_SCHEMA_COLUMNS: list[str] = [
     "titular",
     "documento_origem",
@@ -23,6 +24,8 @@ MASTER_SCHEMA_COLUMNS: list[str] = [
     "obra_referencia",
     "rubrica",
     "periodo",
+    "periodo_inicial",  # [NEW]
+    "periodo_final",    # [NEW]
     "rendimento",
     "percentual_rateio",
     "valor_rateio",
@@ -63,6 +66,16 @@ def normalize_to_master_schema(
     if "arquivo_origem" not in df.columns:
         df["arquivo_origem"] = None
 
+    # Lógica de Split de Periodo
+    if "periodo" in df.columns:
+        # Aplica a funcao auxiliar para gerar tuplas (inicio, fim)
+        period_tuples = df["periodo"].apply(split_period_range)
+        # Expande as tuplas para as novas colunas
+        df[["periodo_inicial", "periodo_final"]] = pd.DataFrame(period_tuples.tolist(), index=df.index)
+    else:
+        df["periodo_inicial"] = None
+        df["periodo_final"] = None
+
     # Garante que todas as colunas do schema existem
     for col in MASTER_SCHEMA_COLUMNS:
         if col not in df.columns:
@@ -88,6 +101,24 @@ def format_period(period_str: Optional[str]) -> Optional[str]:
     if not period_str:
         return None
     return re.sub(r"\s+A\s+", " - ", period_str.strip())
+
+
+def split_period_range(period_str: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Divide uma string de periodo normalizada em (inicio, fim).
+    Ex: '06/2024 - 08/2024' -> ('06/2024', '08/2024')
+    Ex: '01/2024' -> ('01/2024', '01/2024')
+    """
+    if not period_str:
+        return None, None
+    
+    parts = period_str.split(" - ")
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    
+    # Caso seja apenas um mes, inicio e fim sao iguais para facilitar range filter
+    single = period_str.strip()
+    return single, single
 
 
 def safe_strip(value: object) -> Optional[str]:
