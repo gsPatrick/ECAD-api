@@ -25,7 +25,7 @@ from fastapi import Depends
 # ---------------------------------------------------------------------------
 
 # Auth Routes (Public)
-app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+app.include_router(auth_router, prefix="/api", tags=["Authentication"])
 
 # Protected Business Routes
 app.include_router(
