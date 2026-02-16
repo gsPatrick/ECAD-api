@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Response
+from fastapi import APIRouter, HTTPException, Depends, Response, Request
 from fastapi.responses import RedirectResponse
 import httpx
 import os
@@ -48,3 +48,10 @@ async def liberar_acesso(token: str, next: str = "/", response: Response = None)
             
         except httpx.RequestError:
             raise HTTPException(status_code=503, detail="Central Hub unavailable")
+
+@router.get("/me")
+async def get_me(request: Request):
+    token = request.cookies.get("satellite_session")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"status": "authenticated", "user": token.split(":")[1] if ":" in token else token}
