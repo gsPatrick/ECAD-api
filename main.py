@@ -14,39 +14,24 @@ from app.config.database import init_db
 from app.config.settings import logger
 from app.features.extractor.ext_routes import router as extractor_router
 from app.utils.cleanup import cleanup_old_files
+from app.router import router as auth_router
+from app.middleware import get_current_user
+from fastapi import Depends
 
-# ---------------------------------------------------------------------------
-# Inicializacao
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="Sistema de Extracao Inteligente de PDFs",
-    description=(
-        "API para extracao, normalizacao e conversao de relatorios musicais "
-        "em PDF para planilhas Excel padronizadas."
-    ),
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-# ---------------------------------------------------------------------------
-# CORS - Permite qualquer origem (ajustar em producao)
-# ---------------------------------------------------------------------------
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ... (Previous middleware setup)
 
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 
-app.include_router(extractor_router)
+# Auth Routes (Public)
+app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+
+# Protected Business Routes
+app.include_router(
+    extractor_router,
+    dependencies=[Depends(get_current_user)]
+)
 
 # ---------------------------------------------------------------------------
 # Eventos de ciclo de vida
