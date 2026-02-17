@@ -40,7 +40,7 @@ async def liberar_acesso(token: str, next: str = "/", response: Response = None)
                 key="satellite_session",
                 value=session_value,
                 httponly=True,
-                secure=False, # Set to True if HTTPS
+                secure=True, # Set to True if HTTPS
                 samesite="lax",
                 max_age=3600 # 1 hour
             )
