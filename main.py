@@ -18,7 +18,32 @@ from app.router import router as auth_router
 from app.middleware import get_current_user
 from fastapi import Depends
 
-# ... (Previous middleware setup)
+# ---------------------------------------------------------------------------
+# Inicializacao
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Sistema de Extracao Inteligente de PDFs",
+    description=(
+        "API para extracao, normalizacao e conversao de relatorios musicais "
+        "em PDF para planilhas Excel padronizadas."
+    ),
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# ---------------------------------------------------------------------------
+# CORS - Permite qualquer origem (ajustar em producao)
+# ---------------------------------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # Routers
