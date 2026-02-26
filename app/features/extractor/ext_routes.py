@@ -295,13 +295,15 @@ async def export_consolidated(
 ) -> FileResponse:
     """Download do arquivo consolidado_mestre.xlsx de um batch."""
     if titulars:
-        # Geração dinâmica para seleção específica
+        # Geração dinâmica para seleção específica (retorna um ZIP)
         path = get_consolidated_export_path(batch_id, titulars=titulars, db=db)
-        filename = f"consolidado_selecao_{batch_id[:8]}.xlsx"
+        filename = f"consolidado_selecao_{batch_id[:8]}.zip"
+        media_type = "application/zip"
     else:
         # Retorno do arquivo já gerado no processamento
         path = get_consolidated_export_path(batch_id)
         filename = "consolidado_mestre.xlsx"
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     if not path or not Path(path).exists():
         raise HTTPException(
@@ -312,7 +314,7 @@ async def export_consolidated(
     return FileResponse(
         path=path,
         filename=filename,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
     )
 
 

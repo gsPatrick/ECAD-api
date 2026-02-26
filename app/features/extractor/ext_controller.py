@@ -263,7 +263,7 @@ def get_export_path(db: Session, job_id: str) -> Optional[str]:
 def get_consolidated_export_path(batch_id: str, titulars: Optional[list[str]] = None, db: Optional[Session] = None) -> Optional[str]:
     """
     Retorna o caminho do excel consolidado de um batch.
-    Se titulars for fornecido, gera um arquivo temporario filtrado.
+    Se titulars for fornecido, gera um arquivo zip contendo um excel filtrado para cada titular.
     """
     if titulars and db:
         # Gerar export filtrado
@@ -271,22 +271,25 @@ def get_consolidated_export_path(batch_id: str, titulars: Optional[list[str]] = 
         if not all_data:
             return None
         
-        # Filtra os dados
-        filtered_data = [row for row in all_data if row.get('titular') in titulars]
-        if not filtered_data:
-            return None
+        # Filtra os dados e cria um zip
+        import zipfile
+        zip_filename = f"consolidado_selecao_{batch_id[:8]}.zip"
+        zip_path = EXPORT_DIR / zip_filename
         
-        df = pd.DataFrame(filtered_data)
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            for titular in titulars:
+                filtered_data = [row for row in all_data if row.get('titular') == titular]
+                if filtered_data:
+                    df = pd.DataFrame(filtered_data)
+                    safe_titular = "".join([c for c in titular if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                    excel_path = export_to_excel([df], f"consolidado_{safe_titular}_{batch_id[:8]}")
+                    if excel_path and Path(excel_path).exists():
+                        zipf.write(excel_path, arcname=f"consolidado_{safe_titular}.xlsx")
         
-        # Gera nome unico para a sessao/selecao
-        unique_suffix = uuid.uuid4().hex[:8]
-        filename = f"consolidado_filtrado_{batch_id}_{unique_suffix}"
-        
-        try:
-            return export_to_excel([df], filename)
-        except Exception:
-            logger.exception("Erro ao gerar export filtrado para batch %s", batch_id)
-            return None
+        if Path(zip_path).exists():
+            return str(zip_path)
+        return None
+
 
     path = EXPORT_DIR / f"consolidado_mestre_{batch_id}.xlsx"
     if path.exists():
