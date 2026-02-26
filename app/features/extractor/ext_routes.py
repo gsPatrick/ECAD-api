@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import (
     APIRouter,
@@ -290,19 +290,28 @@ async def export_file(
 @router.get("/export-consolidated/{batch_id}")
 async def export_consolidated(
     batch_id: str,
+    titulars: Optional[List[str]] = Depends(lambda titulars: titulars.split(',') if titulars else None),
     db: Session = Depends(get_db),
 ) -> FileResponse:
     """Download do arquivo consolidado_mestre.xlsx de um batch."""
-    path = get_consolidated_export_path(batch_id)
-    if not path:
+    if titulars:
+        # Geração dinâmica para seleção específica
+        path = get_consolidated_export_path(batch_id, titulars=titulars, db=db)
+        filename = f"consolidado_selecao_{batch_id[:8]}.xlsx"
+    else:
+        # Retorno do arquivo já gerado no processamento
+        path = get_consolidated_export_path(batch_id)
+        filename = "consolidado_mestre.xlsx"
+
+    if not path or not Path(path).exists():
         raise HTTPException(
             status_code=404,
-            detail="Arquivo consolidado nao encontrado. Verifique se todos os jobs do batch foram concluidos.",
+            detail="Arquivo consolidado nao encontrado ou selecao vazia. Verifique se todos os jobs do batch foram concluidos.",
         )
 
     return FileResponse(
         path=path,
-        filename="consolidado_mestre.xlsx",
+        filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 

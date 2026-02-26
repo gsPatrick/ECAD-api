@@ -5,7 +5,7 @@ import os
 
 # Configuration
 # Ideally these should be in a settings file in the satellite system
-CENTRAL_HUB_URL = os.getenv("CENTRAL_HUB_URL", "http://localhost:8000")
+CENTRAL_HUB_URL = os.getenv("CENTRAL_HUB_URL", "https://hub.sbacem.app.br")
 MY_SYSTEM_ID = os.getenv("MY_SYSTEM_ID", "1") # Change per satellite
 
 async def get_current_user(request: Request):

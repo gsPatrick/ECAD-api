@@ -260,8 +260,34 @@ def get_export_path(db: Session, job_id: str) -> Optional[str]:
     return None
 
 
-def get_consolidated_export_path(batch_id: str) -> Optional[str]:
-    """Retorna o caminho do excel consolidado de um batch."""
+def get_consolidated_export_path(batch_id: str, titulars: Optional[list[str]] = None, db: Optional[Session] = None) -> Optional[str]:
+    """
+    Retorna o caminho do excel consolidado de um batch.
+    Se titulars for fornecido, gera um arquivo temporario filtrado.
+    """
+    if titulars and db:
+        # Gerar export filtrado
+        all_data = get_batch_data(db, batch_id)
+        if not all_data:
+            return None
+        
+        # Filtra os dados
+        filtered_data = [row for row in all_data if row.get('titular') in titulars]
+        if not filtered_data:
+            return None
+        
+        df = pd.DataFrame(filtered_data)
+        
+        # Gera nome unico para a sessao/selecao
+        unique_suffix = uuid.uuid4().hex[:8]
+        filename = f"consolidado_filtrado_{batch_id}_{unique_suffix}"
+        
+        try:
+            return export_to_excel([df], filename)
+        except Exception:
+            logger.exception("Erro ao gerar export filtrado para batch %s", batch_id)
+            return None
+
     path = EXPORT_DIR / f"consolidado_mestre_{batch_id}.xlsx"
     if path.exists():
         return str(path)
