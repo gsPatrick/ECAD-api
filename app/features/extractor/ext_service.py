@@ -288,6 +288,12 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                 isrc_detected = extract_isrc_from_line(line)
                 if isrc_detected:
                     current_isrc = isrc_detected
+                    # Se encontramos um ISRC isolado, verificamos se ele pertence à linha anterior
+                    # (Alguns layouts colocam o ISRC na linha DEBAIXO do rateio)
+                    if rows and not rows[-1].get("isrc_iswc"):
+                        rows[-1]["isrc_iswc"] = current_isrc
+                        logger.debug(f"ISRC vinculado retroativamente à linha {len(rows)}: {current_isrc}")
+                    
                     # Se a linha CONTEM apenas ISRC, pula
                     cleaned = re.sub(r"ISRC\s+[A-Z]{2}[\w-]+", "", line).strip()
                     if not cleaned or len(cleaned) < 5:
@@ -343,10 +349,11 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                     data_match = re_data_line_digital.match(line)
 
                 if data_match:
-                    # Se nao temos ISRC, busca em janela de linhas vizinhas
+                    # Se nao temos ISRC, busca em janela de linhas vizinhas (especialmente acima)
                     line_idx = lines.index(line.strip()) if line.strip() in lines else -1
                     if not current_isrc and line_idx >= 0:
-                        current_isrc = extract_isrc_from_window(lines, line_idx, window_size=2)
+                        # Buscamos apenas 1 linha para cima aqui; a busca para baixo é feita retroativamente
+                        current_isrc = extract_isrc_from_window(lines, line_idx, window_size=1)
 
                     row = {
                         "titular": titular,
@@ -361,8 +368,7 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         "valor_rateio": clean_monetary_value(data_match.group(6)),
                         "correcao": data_match.group(7).strip(),
                         "execucoes": clean_text(data_match.group(8)),
-                        "categoria": data_match.group(9).strip(),
-                        "caracteristica": data_match.group(10).strip(),
+                        "cat_caracteristica": f"{data_match.group(9).strip()} {data_match.group(10).strip()}",
                         "isrc_iswc": current_isrc,
                         "data_pagamento": periodo_dist,
                         "valor_bruto": clean_monetary_value(data_match.group(4)),
@@ -372,9 +378,28 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         "or_e_peso": clean_text(data_match.group(11)) if data_match.lastindex >= 11 else None,
                     }
                     rows.append(row)
+                    
+                    # Log de depuração comparativo (AuditTrail)
+                    logger.debug(
+                        f"Audit [Line {page_idx+1}:{len(rows)}]: Raw='{line}' "
+                        f"-> Obra='{row['obra_referencia']}', Rubrica='{row['rubrica']}', Valor={row['valor_liquido']}"
+                    )
+
                     # ISRC consumido
                     current_isrc = None
                     continue
+
+                # --- TRATAMENTO DE MULTI-LINHA (OBRA) ---
+                # Se chegamos aqui e temos uma obra ativa, e a linha não é ISRC nem lixo,
+                # e não deu match em dados, pode ser a continuação do título da obra.
+                if current_obra_codigo and not isrc_detected:
+                    # Filtra lixo óbvio
+                    if len(line) > 5 and not any(kw in line for kw in ["ECAD.Tec", "Pag", "DISTRIBUIÇÃO"]):
+                        if current_obra_titulo:
+                            current_obra_titulo = f"{current_obra_titulo} {clean_text(line)}"
+                        else:
+                            current_obra_titulo = clean_text(line)
+                        logger.debug(f"Continuação de título de Obra: {current_obra_titulo}")
 
                 # Tenta match alternativo para linhas sem o padrao 'AP-'
                 # Possiveis linhas de continuacao (capitulo, etc.)
@@ -423,6 +448,34 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
         return pd.DataFrame(columns=MASTER_SCHEMA_COLUMNS)
 
     df = pd.DataFrame(rows)
+    
+    # --- VALIDAÇÃO DE SOMAS ---
+    if valor_total is not None:
+        total_header = clean_monetary_value(valor_total)
+        total_extraido = df["valor_rateio"].sum()
+        
+        # Arredonda para 2 casas para evitar problemas de precisão de float
+        total_header_round = round(total_header, 2) if total_header is not None else 0.0
+        total_extraido_round = round(total_extraido, 2)
+        
+        diff = abs(total_header_round - total_extraido_round)
+        
+        logger.info(
+            f"Validação de Soma [{tipo}]: Header={total_header_round}, Extraído={total_extraido_round}, Diff={diff}"
+        )
+        
+        if diff > 0.02:  # Tolerância pequena para arredondamentos em centavos
+            msg = (
+                f"ERRO DE INTEGRIDADE: A soma dos valores extraídos (R$ {total_extraido_round}) "
+                f"não confere com o total do PDF (R$ {total_header_round}). "
+                f"Diferença: R$ {diff:.2f}. "
+                f"Verifique o layout do arquivo '{original_filename}'."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+    else:
+        logger.warning(f"Aviso: Valor total não encontrado no cabeçalho do PDF '{original_filename}' para validação.")
+
     return normalize_to_master_schema(df, tipo, titular=titular, documento_origem=tipo)
 
 

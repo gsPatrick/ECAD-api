@@ -205,37 +205,49 @@ def extract_isrc_from_window(
 
 def clean_monetary_value(value: str) -> Optional[float]:
     """
-    Limpa e converte um valor monetario brasileiro para float.
-    - '1.234,56' -> 1234.56
-    - '0,00' -> 0.0
-    - '---' -> None (Null no Excel)
+    Limpa e converte um valor monetario brasileiro ou internacional para float.
+    Trata:
+    - '1.234,56' -> 1234.56 (BR)
+    - '1,234.56' -> 1234.56 (US)
+    - '1234,56'  -> 1234.56 (BR simple)
+    - '1234.56'  -> 1234.56 (US simple)
+    - '---'      -> None
     """
     if not value or not isinstance(value, str):
         return None
     
     val = value.strip()
-    
-    # Tratamento explicito pedido pelo usuario
     if val in ("---", "-", "", "None"):
         return None
         
-    # Remove caracteres nao numericos exceto ponto, virgula e sinal negativo
-    numeric_val = re.sub(r"[^\d.,\-]", "", val)
-    if not numeric_val:
+    # Remove símbolos de moeda e espaços (R$, $, etc)
+    val = re.sub(r"[^\d.,\-]", "", val)
+    if not val:
         return None
-        
-    # Formato brasileiro: 1.234,56 -> 1234.56
-    if "," in numeric_val:
-        # Se tem ponto e virgula (1.234,56)
-        if "." in numeric_val:
-            numeric_val = numeric_val.replace(".", "").replace(",", ".")
+
+    # Lógica de detecção de separador:
+    # 1. Se houver ponto E vírgula:
+    if "." in val and "," in val:
+        # Se o ponto vem antes da vírgula (1.234,56) -> Padrão BR
+        if val.rfind(".") < val.rfind(","):
+            val = val.replace(".", "").replace(",", ".")
         else:
-            # So tem virgula (0,00)
-            numeric_val = numeric_val.replace(",", ".")
-            
+            # Padrão US (1,234.56)
+            val = val.replace(",", "")
+    elif "," in val:
+        # Se tem vírgula, quase sempre é padrão BR no contexto do ECAD
+        # Remove eventuais pontos de milhar que sobraram (se houver) e troca vírgula por ponto
+        val = val.replace(",", ".")
+    
+    # Se houver mais de um ponto (ex: 1.234.56 após trocas incorretas), remove os primeiros
+    if val.count(".") > 1:
+        parts = val.split(".")
+        val = "".join(parts[:-1]) + "." + parts[-1]
+
     try:
-        return float(numeric_val)
+        return float(val)
     except ValueError:
+        logger.warning(f"Falha ao converter valor monetário: {value}")
         return None
 
 
