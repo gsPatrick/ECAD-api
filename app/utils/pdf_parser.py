@@ -205,13 +205,8 @@ def extract_isrc_from_window(
 
 def clean_monetary_value(value: str) -> Optional[float]:
     """
-    Limpa e converte um valor monetario brasileiro ou internacional para float.
-    Trata:
-    - '1.234,56' -> 1234.56 (BR)
-    - '1,234.56' -> 1234.56 (US)
-    - '1234,56'  -> 1234.56 (BR simple)
-    - '1234.56'  -> 1234.56 (US simple)
-    - '---'      -> None
+    Limpa e converte um valor monetario para float.
+    Suporta PADRÃO BR (1.234,56) e PADRÃO US (1,234.56).
     """
     if not value or not isinstance(value, str):
         return None
@@ -220,35 +215,60 @@ def clean_monetary_value(value: str) -> Optional[float]:
     if val in ("---", "-", "", "None"):
         return None
         
-    # Remove símbolos de moeda e espaços (R$, $, etc)
+    # Remove símbolos de moeda e espaços (R$, $, etc) e letras.
+    # Mas mantém ponto, vírgula e sinal de negativo.
     val = re.sub(r"[^\d.,\-]", "", val)
     if not val:
         return None
 
     # Lógica de detecção de separador:
-    # 1. Se houver ponto E vírgula:
+    # Se houver ponto e vírgula, decidimos pelo último.
     if "." in val and "," in val:
-        # Se o ponto vem antes da vírgula (1.234,56) -> Padrão BR
         if val.rfind(".") < val.rfind(","):
+            # Padrão BR (1.234,56) -> remove pontos de milhar, troca vírgula por ponto
             val = val.replace(".", "").replace(",", ".")
         else:
-            # Padrão US (1,234.56)
+            # Padrão US (1,234.56) -> remove vírgulas de milhar
             val = val.replace(",", "")
     elif "," in val:
-        # Se tem vírgula, quase sempre é padrão BR no contexto do ECAD
-        # Remove eventuais pontos de milhar que sobraram (se houver) e troca vírgula por ponto
-        val = val.replace(",", ".")
-    
-    # Se houver mais de um ponto (ex: 1.234.56 após trocas incorretas), remove os primeiros
-    if val.count(".") > 1:
-        parts = val.split(".")
-        val = "".join(parts[:-1]) + "." + parts[-1]
+        # Só tem vírgula. Se tiver mais de uma, remove todas exceto a última.
+        if val.count(",") > 1:
+            parts = val.split(",")
+            val = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            val = val.replace(",", ".")
+    elif "." in val:
+        # Só tem ponto. Se tiver mais de um, remove os de milhar.
+        if val.count(".") > 1:
+            parts = val.split(".")
+            val = "".join(parts[:-1]) + "." + parts[-1]
 
     try:
         return float(val)
     except ValueError:
         logger.warning(f"Falha ao converter valor monetário: {value}")
         return None
+
+
+def is_likely_data_line(line: str) -> bool:
+    """
+    Verifica se uma linha provavelmente contém dados de rateio.
+    Critério: Possuir pelo menos 2 valores numéricos formatados como moeda/decimal,
+    especialmente se um for porcentagem ou se houver o separador '---'.
+    """
+    # Procura por padrões de números decimais (1.234,56 ou 1234.56)
+    monetary_pattern = r'[\d]{1,3}(?:\.?\d{3})*(?:,\d+|(?:\.\d+))'
+    matches = re.findall(monetary_pattern, line)
+    
+    # Se tem "---" e pelo menos um número grande, é quase certeza
+    if "---" in line and len(matches) >= 1:
+        return True
+        
+    # Se tem pelo menos 3 números (Rendimento, Rateio, Valor), é provável
+    if len(matches) >= 3:
+        return True
+        
+    return False
 
 
 def clean_text(text: Optional[str]) -> Optional[str]:

@@ -35,6 +35,7 @@ from app.utils.pdf_parser import (
     extract_isrc_from_line,
     extract_isrc_from_window,
     extract_page_lines,
+    is_likely_data_line,
 )
 
 
@@ -229,132 +230,57 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
             lines = extract_page_lines(page)
             skip_header = True
 
-            for line in lines:
+            for line_idx, line in enumerate(lines):
                 line = line.strip()
                 if not line:
                     continue
 
-                # Ignora linhas de cabecalho do documento
-                if skip_header:
-                    if "OBRA" in line and ("RUBRICA" in line or "RENDIMENTO" in line or "PERÍODO" in line):
-                        skip_header = False
-                        logger.debug("Fim do cabecalho detectado na linha: %s", line)
-                        continue
-                    if any(
-                        kw in line
-                        for kw in [
-                            "DISTRIBUIÇÃO DE DIREITOS",
-                            "EXECUÇÃO PÚBLICA",
-                            "DEMONSTRATIVO DO TITULAR",
-                            "DISTRIBUIÇÃO DE PRESCRITÍVEIS",
-                            "ANTECIPAÇÃO DE PRESCRITOS",
-                            "CNPJ/CPF:",
-                            "CAE/IPI:",
-                            "COD ECAD:",
-                            "A B R A M U S",
-                            "SBACEM",
-                            "ABRAMUS",
-                            "UBC",
-                            "OR.E",
-                            "TP.",
-                        ]
-                    ):
-                        continue
+                # --- 1. DETECÇÃO DE CABEÇALHO DE OBRA (FORWARD FILL) ---
+                # Regex para detectar linha de cabecalho de obra (codigo numerico no inicio)
+                obra_match = re_obra_header.match(line)
+                if not obra_match:
+                    obra_match = re_obra_header_simple.match(line)
+
+                if obra_match:
+                    # Se encontramos uma nova obra, PROCESSAMOS o buffer anterior se houvesse?
+                    # Não, aqui o buffer é apenas para acumular o título.
+                    candidate_codigo = obra_match.group(1)
+                    titulo_raw = obra_match.group(2).strip()
+                    # Limpa o titulo
+                    titulo_clean = clean_text(re.sub(r"\s+[\d.,]+\s*%?\s*[\d.,]*\s*---.*$", "", titulo_raw))
+                    
+                    # Se for apenas números/percentual, não é o título.
+                    if titulo_clean and re.match(r"^[\d.,\s%]+$", titulo_clean):
+                        if current_obra_codigo != candidate_codigo:
+                            current_obra_titulo = None
+                        current_obra_codigo = candidate_codigo
+                    else:
+                        current_obra_codigo = candidate_codigo
+                        current_obra_titulo = titulo_clean
+
+                    current_isrc = None
+                    logger.debug(f"Forward Fill - Obra: [{current_obra_codigo}] {current_obra_titulo}")
                     continue
 
-                # Redetecta header na proxima pagina
-                if "DISTRIBUIÇÃO DE DIREITOS" in line:
-                    skip_header = True
-                    continue
-                if any(
-                    kw in line
-                    for kw in [
-                        "EXEC. - NÚM.",
-                        "AS INFORMAÇÕES REFERENTES",
-                        "ECAD.Tec",
-                        "DEMONSTRATIVO DO TITULAR",
-                        "DISTRIBUIÇÃO DE PRESCRITÍVEIS",
-                        "ANTECIPAÇÃO DE PRESCRITOS",
-                        "CNPJ/CPF:",
-                        "CAE/IPI:",
-                        "COD ECAD:",
-                        "OR.E",
-                        "TP.",
-                    ]
-                ):
-                    continue
-
-                # Verifica se e' uma linha de ISRC (deteccao robusta)
+                # --- 2. DETECÇÃO DE ISRC ---
                 isrc_detected = extract_isrc_from_line(line)
                 if isrc_detected:
                     current_isrc = isrc_detected
-                    # Se encontramos um ISRC isolado, verificamos se ele pertence à linha anterior
-                    # (Alguns layouts colocam o ISRC na linha DEBAIXO do rateio)
+                    # Vinculo retroativo se a última linha não tinha ISRC
                     if rows and not rows[-1].get("isrc_iswc"):
                         rows[-1]["isrc_iswc"] = current_isrc
-                        logger.debug(f"ISRC vinculado retroativamente à linha {len(rows)}: {current_isrc}")
                     
-                    # Se a linha CONTEM apenas ISRC, pula
-                    cleaned = re.sub(r"ISRC\s+[A-Z]{2}[\w-]+", "", line).strip()
-                    if not cleaned or len(cleaned) < 5:
+                    # Se a linha contém APENAS o ISRC, não tentamos processar como dados
+                    cleaned_line = re.sub(r"ISRC\s+[A-Z]{2}[\w-]+", "", line).strip()
+                    if not cleaned_line or len(cleaned_line) < 5:
                         continue
 
-                # Verifica se e' uma linha de cabecalho de obra (Forward Fill)
-                obra_match = re_obra_header.match(line)
-                if obra_match:
-                    current_obra_codigo = obra_match.group(1)
-                    titulo_raw = obra_match.group(2).strip()
-                    # Limpa o titulo removendo valores numericos no final
-                    titulo_clean = re.sub(r"\s+[\d.,]+\s*%?\s*[\d.,]*\s*---.*$", "", titulo_raw)
-                    current_obra_titulo = clean_text(titulo_clean)
-                    current_isrc = None
-                    logger.debug(
-                        "Forward Fill - Nova obra: [%s] %s",
-                        current_obra_codigo,
-                        current_obra_titulo,
-                    )
-                    continue
-
-                # Tenta match simplificado de obra (apenas codigo + titulo)
-                if not obra_match:
-                    simple_match = re_obra_header_simple.match(line)
-                    if simple_match:
-                        candidate_code = simple_match.group(1)
-                        candidate_rest = simple_match.group(2).strip()
-                        # Se o restante nao possui padroes de dados, e' um cabecalho de obra
-                        if not re.search(r"AP-|SPOTIFY|TIKTOK|YOUTUBE|DEEZER", candidate_rest):
-                            # Verifica se parece ser: CODIGO TITULO VALOR_TOTAL --- EXEC
-                            title_match = re.match(
-                                r"^(.+?)\s+([\d.,]+)\s*---\s*(.*)", candidate_rest
-                            )
-                            if title_match:
-                                current_obra_codigo = candidate_code
-                                current_obra_titulo = clean_text(title_match.group(1))
-                                current_isrc = None
-                                continue
-                            # Pode ser: CODIGO PERCENTUAL % VALOR --- ...
-                            perc_match = re.match(
-                                r"^(\d+)\s+%\s+([\d.,]+)\s*---", candidate_rest
-                            )
-                            if perc_match:
-                                current_obra_codigo = candidate_code
-                                current_obra_titulo = None
-                                current_isrc = None
-                                continue
-
-                # Tenta extrair linha de dados padrao (AP-...)
-                data_match = re_data_line.match(line)
-                if not data_match:
-                    # Tenta match digital
-                    data_match = re_data_line_digital.match(line)
-
+                # --- 3. DETECÇÃO DE LINHA DE DADOS (RATEIO) ---
+                # Primeiro tentamos os patterns específicos (mais seguros)
+                data_match = re_data_line.match(line) or re_data_line_digital.match(line)
+                
                 if data_match:
-                    # Se nao temos ISRC, busca em janela de linhas vizinhas (especialmente acima)
-                    line_idx = lines.index(line.strip()) if line.strip() in lines else -1
-                    if not current_isrc and line_idx >= 0:
-                        # Buscamos apenas 1 linha para cima aqui; a busca para baixo é feita retroativamente
-                        current_isrc = extract_isrc_from_window(lines, line_idx, window_size=1)
-
+                    # Match perfeito. Extraímos os dados.
                     row = {
                         "titular": titular,
                         "documento_origem": tipo,
@@ -369,37 +295,69 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         "correcao": data_match.group(7).strip(),
                         "execucoes": clean_text(data_match.group(8)),
                         "cat_caracteristica": f"{data_match.group(9).strip()} {data_match.group(10).strip()}",
-                        "isrc_iswc": current_isrc,
+                        "isrc_iswc": current_isrc or extract_isrc_from_window(lines, line_idx, window_size=1),
                         "data_pagamento": periodo_dist,
                         "valor_bruto": clean_monetary_value(data_match.group(4)),
                         "valor_liquido": clean_monetary_value(data_match.group(6)),
                         "tipo_extracao": tipo,
                         "artista_gravacao": clean_text(data_match.group(1)),
-                        "or_e_peso": clean_text(data_match.group(11)) if data_match.lastindex >= 11 else None,
                     }
                     rows.append(row)
-                    
-                    # Log de depuração comparativo (AuditTrail)
-                    logger.debug(
-                        f"Audit [Line {page_idx+1}:{len(rows)}]: Raw='{line}' "
-                        f"-> Obra='{row['obra_referencia']}', Rubrica='{row['rubrica']}', Valor={row['valor_liquido']}"
-                    )
-
-                    # ISRC consumido
                     current_isrc = None
                     continue
 
-                # --- TRATAMENTO DE MULTI-LINHA (OBRA) ---
-                # Se chegamos aqui e temos uma obra ativa, e a linha não é ISRC nem lixo,
-                # e não deu match em dados, pode ser a continuação do título da obra.
-                if current_obra_codigo and not isrc_detected:
-                    # Filtra lixo óbvio
-                    if len(line) > 5 and not any(kw in line for kw in ["ECAD.Tec", "Pag", "DISTRIBUIÇÃO"]):
-                        if current_obra_titulo:
-                            current_obra_titulo = f"{current_obra_titulo} {clean_text(line)}"
-                        else:
-                            current_obra_titulo = clean_text(line)
-                        logger.debug(f"Continuação de título de Obra: {current_obra_titulo}")
+                # --- 4. FALLBACK "CAPTURE TUDO" ---
+                # Se não deu match perfeito, mas a linha PARECE ter valores de rateio
+                if is_likely_data_line(line):
+                    # Tenta extrair valores monetários soltos
+                    # Padrão: qualquer coisa ... VALOR1 ... VALOR2 ... VALOR3 ... --- ...
+                    # Usamos uma regex mais relaxada para capturar os campos finais
+                    fallback_match = re.search(r"([\d.,\-]+)\s+([\d.,\-]+)\s+([\d.,\-]+)\s+(---)\s+", line)
+                    if fallback_match:
+                        rendimento = clean_monetary_value(fallback_match.group(1))
+                        perc = clean_monetary_value(fallback_match.group(2))
+                        rateio = clean_monetary_value(fallback_match.group(3))
+                        
+                        if rateio is not None:
+                            # Tenta descobrir rubrica e artista por posição relativa
+                            prefix = line[:fallback_match.start()].strip()
+                            # Rubrica costuma ser a última palavra antes dos números
+                            prefix_parts = prefix.split()
+                            rubrica = prefix_parts[-1] if prefix_parts else "N/A"
+                            artista = " ".join(prefix_parts[:-1]) if len(prefix_parts) > 1 else prefix
+                            
+                            row = {
+                                "titular": titular,
+                                "documento_origem": tipo,
+                                "arquivo_origem": original_filename,
+                                "obra_referencia": current_obra_titulo or current_obra_codigo,
+                                "obra_codigo": current_obra_codigo,
+                                "rubrica": rubrica,
+                                "periodo": periodo_dist, # Fallback para o período do cabeçalho
+                                "rendimento": rendimento,
+                                "percentual_rateio": perc,
+                                "valor_rateio": rateio,
+                                "correcao": "---",
+                                "isrc_iswc": current_isrc,
+                                "valor_liquido": rateio,
+                                "artista_gravacao": artista,
+                                "tipo_extracao": tipo + "_FALLBACK"
+                            }
+                            rows.append(row)
+                            logger.info(f"Linha capturada via FALLBACK: {line}")
+                            current_isrc = None
+                            continue
+
+                # --- 5. MULTI-LINE BUFFER (OBRA/TÍTULO) ---
+                # Se a linha não é dado, não é ISRC, e parece ser texto, acumulamos no título da obra
+                if current_obra_codigo and len(line) > 3:
+                    # Evita acumular rodapés conhecidos
+                    if not any(kw in line for kw in ["ECAD.Tec", "Página", "DEMONSTRATIVO", "Total"]):
+                         if current_obra_titulo:
+                             current_obra_titulo += " " + line
+                         else:
+                             current_obra_titulo = line
+                         logger.debug(f"Acumulando título (multi-line): {current_obra_titulo}")
 
                 # Tenta match alternativo para linhas sem o padrao 'AP-'
                 # Possiveis linhas de continuacao (capitulo, etc.)
