@@ -25,8 +25,12 @@ def run_ssh_commands(commands):
         print(f"Falha na conexao: {e}")
 
 commands = [
-    "cd /opt/apidois && git pull origin main",
+    "cd /opt/apidois && git fetch origin main && git reset --hard origin/main",
+    "rm -rf /opt/apidois/venv",
+    "python3 -m venv /opt/apidois/venv",
+    "/opt/apidois/venv/bin/pip install --upgrade pip",
     "/opt/apidois/venv/bin/pip install -r /opt/apidois/requirements.txt",
+    "fuser -k 8000/tcp || true",
     "systemctl restart apidois",
     "systemctl status apidois | grep Active"
 ]

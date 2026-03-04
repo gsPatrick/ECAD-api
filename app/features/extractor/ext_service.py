@@ -185,6 +185,7 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
     current_obra_codigo: Optional[str] = None
     current_obra_titulo: Optional[str] = None
     current_isrc: Optional[str] = None
+    has_data_for_current_obra = False  # Track if current obra already has data rows
 
     # Regex para detectar linha de cabecalho de obra (codigo numerico no inicio)
     re_obra_header = re.compile(r"^(\d{5,})\s+(.+?)(?:\s+[\d.,]+\s*---|\s*$)")
@@ -235,21 +236,27 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                 if not line:
                     continue
 
+                # --- 0. FILTRO DE RUÍDO (FOOTERS/DISCLAIMERS) ---
+                # Padrões comuns de rodapé e avisos legais do ECAD que não devem ser processados
+                if any(kw in line for kw in [
+                    "informações referentes aos tipos", "critérios de distribuição", "Eu Faço Música",
+                    "http://www.ecad.org.br", "O LINK DO SITE É", "CAE/IPI: 753222167",
+                    "RENDIMENTO % RATEIO CORREÇÃO", "OR.E TP. OBRA", "CLASSIFICAÇÃO DA OBRA",
+                    "ECAD.Tec", "Página", "DEMONSTRATIVO", "ECAD - TEC", "IDENTIFICAÇÃO DE RUBRICA"
+                ]) or (re.search(r"http[s]?://", line) and len(line) > 100):
+                    if not is_likely_data_line(line):
+                        continue
+
                 # --- 1. DETECÇÃO DE CABEÇALHO DE OBRA (FORWARD FILL) ---
-                # Regex para detectar linha de cabecalho de obra (codigo numerico no inicio)
                 obra_match = re_obra_header.match(line)
                 if not obra_match:
                     obra_match = re_obra_header_simple.match(line)
 
                 if obra_match:
-                    # Se encontramos uma nova obra, PROCESSAMOS o buffer anterior se houvesse?
-                    # Não, aqui o buffer é apenas para acumular o título.
                     candidate_codigo = obra_match.group(1)
                     titulo_raw = obra_match.group(2).strip()
-                    # Limpa o titulo
                     titulo_clean = clean_text(re.sub(r"\s+[\d.,]+\s*%?\s*[\d.,]*\s*---.*$", "", titulo_raw))
                     
-                    # Se for apenas números/percentual, não é o título.
                     if titulo_clean and re.match(r"^[\d.,\s%]+$", titulo_clean):
                         if current_obra_codigo != candidate_codigo:
                             current_obra_titulo = None
@@ -259,6 +266,8 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         current_obra_titulo = titulo_clean
 
                     current_isrc = None
+                    # Resetamos a flag de dados para esta nova obra
+                    has_data_for_current_obra = False
                     logger.debug(f"Forward Fill - Obra: [{current_obra_codigo}] {current_obra_titulo}")
                     continue
 
@@ -281,6 +290,7 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                 
                 if data_match:
                     # Match perfeito. Extraímos os dados.
+                    has_data_for_current_obra = True
                     row = {
                         "titular": titular,
                         "documento_origem": tipo,
@@ -310,10 +320,9 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                 # Se não deu match perfeito, mas a linha PARECE ter valores de rateio
                 if is_likely_data_line(line):
                     # Tenta extrair valores monetários soltos
-                    # Padrão: qualquer coisa ... VALOR1 ... VALOR2 ... VALOR3 ... --- ...
-                    # Usamos uma regex mais relaxada para capturar os campos finais
                     fallback_match = re.search(r"([\d.,\-]+)\s+([\d.,\-]+)\s+([\d.,\-]+)\s+(---)\s+", line)
                     if fallback_match:
+                        has_data_for_current_obra = True
                         rendimento = clean_monetary_value(fallback_match.group(1))
                         perc = clean_monetary_value(fallback_match.group(2))
                         rateio = clean_monetary_value(fallback_match.group(3))
@@ -321,7 +330,6 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         if rateio is not None:
                             # Tenta descobrir rubrica e artista por posição relativa
                             prefix = line[:fallback_match.start()].strip()
-                            # Rubrica costuma ser a última palavra antes dos números
                             prefix_parts = prefix.split()
                             rubrica = prefix_parts[-1] if prefix_parts else "N/A"
                             artista = " ".join(prefix_parts[:-1]) if len(prefix_parts) > 1 else prefix
@@ -349,15 +357,18 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                             continue
 
                 # --- 5. MULTI-LINE BUFFER (OBRA/TÍTULO) ---
-                # Se a linha não é dado, não é ISRC, e parece ser texto, acumulamos no título da obra
-                if current_obra_codigo and len(line) > 3:
-                    # Evita acumular rodapés conhecidos
-                    if not any(kw in line for kw in ["ECAD.Tec", "Página", "DEMONSTRATIVO", "Total"]):
-                         if current_obra_titulo:
-                             current_obra_titulo += " " + line
-                         else:
-                             current_obra_titulo = line
-                         logger.debug(f"Acumulando título (multi-line): {current_obra_titulo}")
+                # Só permitimos acumular título se NÃO capturamos dados ainda para esta obra.
+                # Isso evita que rodapés no fim da página sejam anexados ao título.
+                if current_obra_codigo and not has_data_for_current_obra and len(line) > 3:
+                     if current_obra_titulo:
+                         current_obra_titulo += " " + line
+                     else:
+                         current_obra_titulo = line
+                     
+                     # Limita tamanho para evitar capturas catastróficas
+                     if len(current_obra_titulo) > 500:
+                         current_obra_titulo = current_obra_titulo[:500]
+                     logger.debug(f"Acumulando título (multi-line): {current_obra_titulo}")
 
                 # Tenta match alternativo para linhas sem o padrao 'AP-'
                 # Possiveis linhas de continuacao (capitulo, etc.)
@@ -451,6 +462,7 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
     current_situacao: Optional[str] = None
     current_tipo_obra: Optional[str] = None
     current_nacional: Optional[str] = None
+    has_data_for_current_obra = False # Track if current obra already has data rows
 
     # Regex para linha de obra
     # Formato: COD_OBRA ISWC/vazio TITULO ASS SITUACAO TIPO_OBRA NAC INCLUSAO
@@ -488,10 +500,21 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
         for page_idx, page in enumerate(pdf.pages):
             lines = extract_page_lines(page)
             in_data = False
+            # has_data_for_current_obra = False # Moved initialization outside page loop
 
             for line in lines:
                 line = line.strip()
                 if not line:
+                    continue
+
+                # --- 0. FILTRO DE RUÍDO (FOOTERS/DISCLAIMERS) ---
+                # Padrões comuns de rodapé e avisos legais do ECAD que não devem ser processados
+                if any(kw in line for kw in [
+                    "informações referentes aos tipos", "critérios de distribuição", "Eu Faço Música",
+                    "http://www.ecad.org.br", "CAE/IPI:", "CÓD. ECAD:", "A B R A M U S", 
+                    "RENDIMENTO % RATEIO CORREÇÃO", "OR.E TP. OBRA", "CLASSIFICAÇÃO DA OBRA",
+                    "ECAD.Tec", "Página", "DEMONSTRATIVO", "ECAD - TEC", "IDENTIFICAÇÃO DE RUBRICA"
+                ]) or re.search(r"http[s]?://", line) or "DANILLO DAVILLA" in line:
                     continue
 
                 # Ignora cabecalhos repetidos
@@ -509,7 +532,7 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
                         "* SITUAÇÃO",
                         "CLASSIFICAÇÃO DA OBRA",
                         "Pag ",
-                        "ECAD.Tec",
+                        # "ECAD.Tec", # Already in general noise filter
                     ]
                 ):
                     if "CÓD. OBRA" in line or "CÓDIGO" in line:
@@ -518,43 +541,63 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
 
                 in_data = True
 
-                # --- 3. FALLBACK "CAPTURE TUDO" (PARTICIPANTE) ---
-                # Se não deu match, mas tem percentual no final
-                if is_likely_data_line(line):
-                    fallback_match = re.search(r"([\d.,]+)$", line)
-                    if fallback_match:
-                        perc = clean_monetary_value(fallback_match.group(1))
-                        prefix = line[:fallback_match.start()].strip()
-                        parts = prefix.split()
-                        
-                        if len(parts) >= 2:
-                             row = {
-                                "titular": titular,
-                                "documento_origem": "RELATORIO_ANALITICO_AUTORAL",
-                                "obra_referencia": current_obra_titulo or current_obra_codigo,
-                                "obra_codigo": current_obra_codigo,
-                                "isrc_iswc": current_iswc,
-                                "cod_ecad_participante": parts[0],
-                                "nome_participante": clean_text(" ".join(parts[1:])),
-                                "percentual_rateio": perc,
-                                "tipo_extracao": "RELATORIO_ANALITICO_AUTORAL_FALLBACK",
-                            }
-                             rows.append(row)
-                             logger.info(f"FALLBACK Autoral: {line}")
-                             continue
+                # --- 1. DETECÇÃO DE CABEÇALHO DE OBRA (FORWARD FILL) ---
+                obra_match = re_obra.match(line)
+                if not obra_match:
+                    obra_match = re_obra_simple.match(line)
+                if not obra_match:
+                    obra_match = re_obra_no_iswc.match(line)
 
-                # --- 4. MULTI-LINE BUFFER (TÍTULO DE OBRA) ---
-                if current_obra_codigo and not re.match(r"^\d", line):
-                    if len(line) > 5 and not any(kw in line for kw in ["ECAD.Tec", "Pag", "RELATÓRIO"]):
-                        if current_obra_titulo:
-                            current_obra_titulo += " " + line
-                        else:
-                            current_obra_titulo = line
-                        logger.debug(f"Acumulando título Autoral: {current_obra_titulo}")
+                if obra_match:
+                    has_data_for_current_obra = False
+                    current_obra_codigo = obra_match.group(1)
+                    
+                    # Determine ISWC and title based on which regex matched and its groups
+                    if re_obra.match(line):
+                        current_iswc = obra_match.group(2) if obra_match.group(2) else None
+                        current_obra_titulo = clean_text(obra_match.group(3))
+                        current_situacao = obra_match.group(5)
+                        current_tipo_obra = obra_match.group(6)
+                        current_nacional = obra_match.group(7)
+                    elif re_obra_simple.match(line):
+                        current_iswc = obra_match.group(2)
+                        current_obra_titulo = clean_text(obra_match.group(3))
+                        current_situacao = obra_match.group(5) # This might be wrong, re_obra_simple has different group structure
+                        current_tipo_obra = obra_match.group(6)
+                        current_nacional = obra_match.group(7)
+                    elif re_obra_no_iswc.match(line):
+                        current_iswc = None
+                        current_obra_titulo = clean_text(obra_match.group(2))
+                        current_situacao = obra_match.group(4)
+                        current_tipo_obra = obra_match.group(5)
+                        current_nacional = obra_match.group(6)
+                    else: # Fallback if none of the specific obra regexes matched perfectly
+                        current_iswc = None
+                        current_obra_titulo = clean_text(obra_match.group(2)) # Assume group 2 is title for simple cases
 
-                # Tenta match de participante
+                    logger.debug(
+                        "Forward Fill Autoral - Obra: [%s] %s (ISWC: %s)",
+                        current_obra_codigo,
+                        current_obra_titulo,
+                        current_iswc,
+                    )
+                    continue
+
+                # --- 2. DETECÇÃO DE ISRC/ISWC (Standalone) ---
+                # This is less critical for Autoral as ISWC is often in the obra line,
+                # but good to have for robustness.
+                iswc_detected = extract_iswc_from_line(line)
+                if iswc_detected:
+                    current_iswc = iswc_detected
+                    # If the line contains ONLY the ISWC, don't try to process as data
+                    cleaned_line = re.sub(r"T-[\d.\-]+", "", line).strip()
+                    if not cleaned_line or len(cleaned_line) < 5:
+                        continue
+
+                # --- 3. DETECÇÃO DE LINHA DE DADOS (PARTICIPANTE) ---
                 part_match = re_participante.match(line)
                 if part_match:
+                    has_data_for_current_obra = True
                     row = {
                         "titular": titular,
                         "documento_origem": "RELATORIO_ANALITICO_AUTORAL",
@@ -633,7 +676,7 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
                 if not line:
                     continue
 
-                # Ignora cabecalhos
+                # Ignora cabecalhos repetidos
                 if any(
                     kw in line
                     for kw in [
@@ -656,10 +699,86 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
                 ):
                     continue
 
-                # --- 3. FALLBACK "CAPTURE TUDO" (CONEXO) ---
+                # --- 0. FILTRO DE RUÍDO (FOOTERS/DISCLAIMERS) ---
+                if any(kw in line for kw in [
+                    "informações referentes aos tipos", "critérios de distribuição", "Eu Faço Música",
+                    "http://www.ecad.org.br", "O LINK DO SITE É", "CAE/IPI: 753222167",
+                    "RENDIMENTO % RATEIO CORREÇÃO", "OR.E TP. OBRA", "CLASSIFICAÇÃO DA OBRA",
+                    "ECAD.Tec", "Página", "DEMONSTRATIVO", "ECAD - TEC", "IDENTIFICAÇÃO DE RUBRICA"
+                ]) or (re.search(r"http[s]?://", line) and len(line) > 100):
+                    if not is_likely_data_line(line):
+                        continue
+
+                # --- 1. DETECÇÃO DE GRAVAÇÃO (FORWARD FILL) ---
+                grav_match = re_gravacao.match(line)
+                if grav_match:
+                    has_data_for_current_obra = False
+                    current_gravacao_codigo = grav_match.group(1)
+                    current_isrc = grav_match.group(2)
+                    current_situacao = grav_match.group(3)
+                    current_gravacao_titulo = clean_text(grav_match.group(4))
+                    current_complemento = None
+                    logger.debug(
+                        "Forward Fill Conexo - Gravacao: [%s] %s (%s)",
+                        current_gravacao_codigo,
+                        current_gravacao_titulo,
+                        current_isrc,
+                    )
+                    continue
+
+                # Fallback: linha comecando com codigo numerico + ISRC
+                if not grav_match and re.match(r"^\d{5,}", line):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        code = parts[0]
+                        isrc_candidate = parts[1] if len(parts) > 1 else ""
+                        if re.match(r"^[A-Z]{2}-[\w-]+$", isrc_candidate):
+                            has_data_for_current_obra = False
+                            current_gravacao_codigo = code
+                            current_isrc = isrc_candidate
+                            # Tenta extrair situacao e titulo
+                            rest = " ".join(parts[2:])
+                            sit_match = re.match(
+                                r"(LIBERADO|BLOQUEADO|PENDENTE)\s+(.+?)(?:\s+(SIM|NÃO|NAO))?\s*([X\s]*)$",
+                                rest,
+                            )
+                            if sit_match:
+                                current_situacao = sit_match.group(1)
+                                current_gravacao_titulo = clean_text(sit_match.group(2))
+                            else:
+                                current_gravacao_titulo = clean_text(rest)
+                            current_complemento = None
+                            continue
+                        
+                        # Se não é ISRC, pode ser um participante
+                        part_match = re_participante_conexo.match(line)
+                        if part_match:
+                            has_data_for_current_obra = True
+                            row = {
+                                "titular": titular,
+                                "documento_origem": "RELATORIO_ANALITICO_CONEXO",
+                                "obra_referencia": current_gravacao_titulo,
+                                "obra_codigo": current_gravacao_codigo,
+                                "isrc_iswc": current_isrc,
+                                "situacao": current_situacao,
+                                "complemento_titulo": current_complemento,
+                                "cod_ecad_participante": part_match.group(1),
+                                "nome_participante": clean_text(part_match.group(2)),
+                                "pseudonimo_participante": clean_text(part_match.group(3)),
+                                "categoria": part_match.group(4),
+                                "subcategoria": part_match.group(5),
+                                "associacao_participante": part_match.group(6),
+                                "percentual_rateio": clean_monetary_value(part_match.group(7)),
+                                "tipo_extracao": "RELATORIO_ANALITICO_CONEXO",
+                            }
+                            rows.append(row)
+                            continue
+
+                # --- 2. FALLBACK "CAPTURE TUDO" (CONEXO) ---
                 if is_likely_data_line(line):
                     fallback_match = re.search(r"([\d.,]+)$", line)
                     if fallback_match:
+                        has_data_for_current_obra = True
                         perc = clean_monetary_value(fallback_match.group(1))
                         prefix = line[:fallback_match.start()].strip()
                         parts = prefix.split()
@@ -679,13 +798,16 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
                              logger.info(f"FALLBACK Conexo: {line}")
                              continue
 
-                # --- 4. MULTI-LINE BUFFER (TÍTULO DE GRAVAÇÃO) ---
-                if current_gravacao_codigo and not re.match(r"^\d", line):
-                    if len(line) > 5 and not any(kw in line for kw in ["ECAD.Tec", "Pag", "RELATÓRIO"]):
+                # --- 3. MULTI-LINE BUFFER (TÍTULO DE GRAVAÇÃO) ---
+                if current_gravacao_codigo and not has_data_for_current_obra and not re.match(r"^\d", line):
+                    if len(line) > 5:
                         if current_gravacao_titulo:
                             current_gravacao_titulo += " " + line
                         else:
                             current_gravacao_titulo = line
+                        
+                        if len(current_gravacao_titulo) > 500:
+                            current_gravacao_titulo = current_gravacao_titulo[:500]
                         logger.debug(f"Acumulando título Conexo: {current_gravacao_titulo}")
 
     logger.info(
