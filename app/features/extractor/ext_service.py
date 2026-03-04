@@ -518,73 +518,39 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
 
                 in_data = True
 
-                # Tenta match de obra com ISWC
-                obra_match = re_obra.match(line)
-                if not obra_match:
-                    obra_match = re_obra_simple.match(line)
-                if not obra_match:
-                    obra_match = re_obra_no_iswc.match(line)
+                # --- 3. FALLBACK "CAPTURE TUDO" (PARTICIPANTE) ---
+                # Se não deu match, mas tem percentual no final
+                if is_likely_data_line(line):
+                    fallback_match = re.search(r"([\d.,]+)$", line)
+                    if fallback_match:
+                        perc = clean_monetary_value(fallback_match.group(1))
+                        prefix = line[:fallback_match.start()].strip()
+                        parts = prefix.split()
+                        
+                        if len(parts) >= 2:
+                             row = {
+                                "titular": titular,
+                                "documento_origem": "RELATORIO_ANALITICO_AUTORAL",
+                                "obra_referencia": current_obra_titulo or current_obra_codigo,
+                                "obra_codigo": current_obra_codigo,
+                                "isrc_iswc": current_iswc,
+                                "cod_ecad_participante": parts[0],
+                                "nome_participante": clean_text(" ".join(parts[1:])),
+                                "percentual_rateio": perc,
+                                "tipo_extracao": "RELATORIO_ANALITICO_AUTORAL_FALLBACK",
+                            }
+                             rows.append(row)
+                             logger.info(f"FALLBACK Autoral: {line}")
+                             continue
 
-                if obra_match:
-                    current_obra_codigo = obra_match.group(1)
-                    if obra_match.lastindex >= 3:
-                        current_iswc = obra_match.group(2) if obra_match.group(2) else None
-                        current_obra_titulo = clean_text(obra_match.group(3))
-                    else:
-                        current_obra_titulo = clean_text(obra_match.group(2))
-                    logger.debug(
-                        "Forward Fill Autoral - Obra: [%s] %s",
-                        current_obra_codigo,
-                        current_obra_titulo,
-                    )
-                    continue
-
-                # Tenta match por fallback: linha que comeca com codigo numerico longo
-                if not obra_match and re.match(r"^\d{5,}", line):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        code = parts[0]
-                        # Verifica se segundo campo pode ser ISWC
-                        rest_text = " ".join(parts[1:])
-                        iswc_m = re.match(r"(T-[\d.\-]+)\s+(.*)", rest_text)
-                        if iswc_m:
-                            current_obra_codigo = code
-                            current_iswc = iswc_m.group(1)
-                            current_obra_titulo = clean_text(iswc_m.group(2).split("ABRAMUS")[0].split("UBC")[0].split("SBACEM")[0].split("SOCINPRO")[0].strip())
+                # --- 4. MULTI-LINE BUFFER (TÍTULO DE OBRA) ---
+                if current_obra_codigo and not re.match(r"^\d", line):
+                    if len(line) > 5 and not any(kw in line for kw in ["ECAD.Tec", "Pag", "RELATÓRIO"]):
+                        if current_obra_titulo:
+                            current_obra_titulo += " " + line
                         else:
-                            # Pode ser um participante ou obra sem ISWC
-                            part_match = re_participante.match(line)
-                            if part_match:
-                                row = {
-                                    "titular": titular,
-                                    "documento_origem": "RELATORIO_ANALITICO_AUTORAL",
-                                    "obra_referencia": current_obra_titulo,
-                                    "obra_codigo": current_obra_codigo,
-                                    "isrc_iswc": current_iswc,
-                                    "cod_ecad_participante": part_match.group(1),
-                                    "nome_participante": clean_text(part_match.group(2)),
-                                    "pseudonimo_participante": clean_text(part_match.group(3)),
-                                    "cae_participante": part_match.group(4),
-                                    "associacao_participante": part_match.group(5),
-                                    "categoria": part_match.group(6),
-                                    "percentual_rateio": clean_monetary_value(part_match.group(7)),
-                                    "tipo_extracao": "RELATORIO_ANALITICO_AUTORAL",
-                                }
-                                rows.append(row)
-                                continue
-                            else:
-                                # Assume que e' uma obra sem ISWC
-                                current_obra_codigo = code
-                                current_iswc = None
-                                titulo_parts = rest_text.split()
-                                # Pega titulo ate encontrar associacao ou keyword
-                                titulo_tokens: list[str] = []
-                                for t in titulo_parts:
-                                    if t in ("ABRAMUS", "UBC", "SBACEM", "SOCINPRO", "LB", "BL", "DU", "ORIGINAL", "VERSAO", "SIM", "NÃO", "NAO"):
-                                        break
-                                    titulo_tokens.append(t)
-                                current_obra_titulo = clean_text(" ".join(titulo_tokens)) if titulo_tokens else None
-                        continue
+                            current_obra_titulo = line
+                        logger.debug(f"Acumulando título Autoral: {current_obra_titulo}")
 
                 # Tenta match de participante
                 part_match = re_participante.match(line)
@@ -690,99 +656,37 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
                 ):
                     continue
 
-                # Tenta match de gravacao
-                grav_match = re_gravacao.match(line)
-                if grav_match:
-                    current_gravacao_codigo = grav_match.group(1)
-                    current_isrc = grav_match.group(2)
-                    current_situacao = grav_match.group(3)
-                    current_gravacao_titulo = clean_text(grav_match.group(4))
-                    current_complemento = None
-                    logger.debug(
-                        "Forward Fill Conexo - Gravacao: [%s] %s (%s)",
-                        current_gravacao_codigo,
-                        current_gravacao_titulo,
-                        current_isrc,
-                    )
-                    continue
-
-                # Fallback: linha comecando com codigo numerico + ISRC
-                if not grav_match and re.match(r"^\d{5,}", line):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        code = parts[0]
-                        isrc_candidate = parts[1] if len(parts) > 1 else ""
-                        if re.match(r"^[A-Z]{2}-[\w-]+$", isrc_candidate):
-                            current_gravacao_codigo = code
-                            current_isrc = isrc_candidate
-                            # Tenta extrair situacao e titulo
-                            rest = " ".join(parts[2:])
-                            sit_match = re.match(
-                                r"(LIBERADO|BLOQUEADO|PENDENTE)\s+(.+?)(?:\s+(SIM|NÃO|NAO))?\s*([X\s]*)$",
-                                rest,
-                            )
-                            if sit_match:
-                                current_situacao = sit_match.group(1)
-                                current_gravacao_titulo = clean_text(sit_match.group(2))
-                            else:
-                                current_gravacao_titulo = clean_text(rest)
-                            current_complemento = None
-                            continue
-                        # Se nao e' ISRC, pode ser um participante
-                        part_match = re_participante_conexo.match(line)
-                        if part_match:
-                            row = {
+                # --- 3. FALLBACK "CAPTURE TUDO" (CONEXO) ---
+                if is_likely_data_line(line):
+                    fallback_match = re.search(r"([\d.,]+)$", line)
+                    if fallback_match:
+                        perc = clean_monetary_value(fallback_match.group(1))
+                        prefix = line[:fallback_match.start()].strip()
+                        parts = prefix.split()
+                        if len(parts) >= 2:
+                             row = {
                                 "titular": titular,
                                 "documento_origem": "RELATORIO_ANALITICO_CONEXO",
                                 "obra_referencia": current_gravacao_titulo,
                                 "obra_codigo": current_gravacao_codigo,
                                 "isrc_iswc": current_isrc,
-                                "situacao": current_situacao,
-                                "complemento_titulo": current_complemento,
-                                "cod_ecad_participante": part_match.group(1),
-                                "nome_participante": clean_text(part_match.group(2)),
-                                "pseudonimo_participante": clean_text(part_match.group(3)),
-                                "categoria": part_match.group(4),
-                                "subcategoria": part_match.group(5),
-                                "associacao_participante": part_match.group(6),
-                                "percentual_rateio": clean_monetary_value(part_match.group(7)),
-                                "tipo_extracao": "RELATORIO_ANALITICO_CONEXO",
+                                "cod_ecad_participante": parts[0],
+                                "nome_participante": clean_text(" ".join(parts[1:])),
+                                "percentual_rateio": perc,
+                                "tipo_extracao": "RELATORIO_ANALITICO_CONEXO_FALLBACK",
                             }
-                            rows.append(row)
-                            continue
+                             rows.append(row)
+                             logger.info(f"FALLBACK Conexo: {line}")
+                             continue
 
-                # Linha complementar (ex: "LIVE (AO VIVO)")
-                if (
-                    current_gravacao_codigo
-                    and not re.match(r"^\d", line)
-                    and len(line.split()) <= 5
-                    and not re_participante_conexo.match(line)
-                ):
-                    current_complemento = clean_text(line)
-                    continue
-
-                # Tenta match de participante
-                part_match = re_participante_conexo.match(line)
-                if part_match:
-                    row = {
-                        "titular": titular,
-                        "documento_origem": "RELATORIO_ANALITICO_CONEXO",
-                        "arquivo_origem": original_filename,
-                        "obra_referencia": current_gravacao_titulo,
-                        "obra_codigo": current_gravacao_codigo,
-                        "isrc_iswc": current_isrc,
-                        "situacao": current_situacao,
-                        "complemento_titulo": current_complemento,
-                        "cod_ecad_participante": part_match.group(1),
-                        "nome_participante": clean_text(part_match.group(2)),
-                        "pseudonimo_participante": clean_text(part_match.group(3)),
-                        "categoria": part_match.group(4),
-                        "subcategoria": part_match.group(5),
-                        "associacao_participante": part_match.group(6),
-                        "percentual_rateio": clean_monetary_value(part_match.group(7)),
-                        "tipo_extracao": "RELATORIO_ANALITICO_CONEXO",
-                    }
-                    rows.append(row)
+                # --- 4. MULTI-LINE BUFFER (TÍTULO DE GRAVAÇÃO) ---
+                if current_gravacao_codigo and not re.match(r"^\d", line):
+                    if len(line) > 5 and not any(kw in line for kw in ["ECAD.Tec", "Pag", "RELATÓRIO"]):
+                        if current_gravacao_titulo:
+                            current_gravacao_titulo += " " + line
+                        else:
+                            current_gravacao_titulo = line
+                        logger.debug(f"Acumulando título Conexo: {current_gravacao_titulo}")
 
     logger.info(
         "Extracao concluida para RELATORIO_ANALITICO_CONEXO: %d linhas de %s",
