@@ -8,6 +8,7 @@ Responsavel por:
 4. Normalizar os dados extraidos para o Schema Mestre.
 5. Exportar os dados consolidados para Excel (.xlsx).
 """
+from __future__ import annotations
 
 import json
 import os
