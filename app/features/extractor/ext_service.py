@@ -858,15 +858,15 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
         r"^(\d{5,})\s+(.+?)(?:\s+(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM))?\s+(LB|BL|BL/DU|DU|LB/DU)\s+(ORIGINAL|VERSAO|ARRANJO|COMPILACAO|TRILHA|PARODIA|MEDLEY)?\s*(SIM|NÃO|NAO)?\s*(\d{2}/\d{2}/\d{4})?\s*$"
     )
 
-    # Regex para linha de titular da obra (participante)
+    # Regex mais robusta para linha de titular da obra (participante)
+    # No Autoral, o Nome, Pseudônimo e CAE vêm em sequência e às vezes sem delimitadores claros.
+    # Usamos a Associação (ABRAMUS, UBC, etc) como a âncora de parada para capturar o bloco de texto anterior.
     re_participante = re.compile(
-        r"^(\d{4,})\s+"       # codigo ecad (grupo 1)
-        r"(.+?)\s+"            # nome titular (grupo 2)
-        r"(?:([A-Z\s.]+?)\s+)?"  # pseudonimo opcional (grupo 3 - mais simples p/ evitar overlap)
-        r"(?:\s*(\d{5}\.\d{2}\.\d{2}\.\d{2}))?\s+"  # CAE opcional (grupo 4)
-        r"(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM)\s+"  # associacao (grupo 5)
-        r"([A-Z]{1,2})\s+"    # categoria (grupo 6)
-        r"([\d.,]+)"           # percentual (grupo 7)
+        r"^(\d{4,})\s+"               # codigo ecad (grupo 1)
+        r"(.+?)\s+"                   # Bloco de texto (Nome/Pseudônimo/CAE) - grupo 2
+        r"(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM|SICAM|SADBRA)\s+"  # associacao (grupo 3)
+        r"([A-Z]{1,2})\s+"            # categoria (grupo 4)
+        r"([\d.,]+)"                   # percentual (grupo 5)
     )
 
     with pdfplumber.open(pdf_path) as pdf:
@@ -971,6 +971,30 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
                 part_match = re_participante.match(line)
                 if part_match:
                     has_data_for_current_obra = True
+                    
+                    # Processamento inteligente do bloco de texto (Nome + Pseudonimo + CAE)
+                    # Ex: "ERIVAL PEREIRA DE MEDEIROS BIGUA 00591.71.69.18"
+                    # Ex: "SANTA FE GESTAO AUTORAL LTDA 01092.98.61.21"
+                    text_block = part_match.group(2).strip()
+                    
+                    # 3.1 Extração de CAE (formato XXXXX.XX.XX.XX)
+                    cae_val = None
+                    cae_match = re.search(r"(\d{5}\.\d{2}\.\d{2}\.\d{2})$", text_block)
+                    if cae_match:
+                        cae_val = cae_match.group(1)
+                        text_block = text_block[:cae_match.start()].strip()
+                    
+                    # 3.2 Separação Nome / Pseudônimo (se houver espaço duplo ou múltiplo)
+                    # Nota: pdfplumber às vezes mescla tudo com espaço simples. 
+                    # Se não houver divisor claro, assumimos o bloco todo como nome para o FIGA Intel não perder dados.
+                    name_parts = re.split(r"\s{2,}", text_block)
+                    if len(name_parts) >= 2:
+                        nome_val = name_parts[0].strip()
+                        pseudo_val = name_parts[1].strip()
+                    else:
+                        nome_val = text_block
+                        pseudo_val = None
+
                     row = {
                         "titular": titular,
                         "documento_origem": "RELATORIO_ANALITICO_AUTORAL",
@@ -979,12 +1003,12 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
                         "obra_codigo": current_obra_codigo,
                         "isrc_iswc": current_iswc,
                         "cod_ecad_participante": part_match.group(1),
-                        "nome_participante": clean_text(part_match.group(2)),
-                        "pseudonimo_participante": clean_text(part_match.group(3)),
-                        "cae_participante": part_match.group(4),
-                        "associacao_participante": part_match.group(5),
-                        "categoria": part_match.group(6),
-                        "percentual_rateio": clean_monetary_value(part_match.group(7)),
+                        "nome_participante": nome_val,
+                        "pseudonimo_participante": pseudo_val,
+                        "cae_participante": cae_val,
+                        "associacao_participante": part_match.group(3),
+                        "categoria": part_match.group(4),
+                        "percentual_rateio": clean_monetary_value(part_match.group(5)),
                         "tipo_extracao": "RELATORIO_ANALITICO_AUTORAL",
                     }
                     rows.append(row)
