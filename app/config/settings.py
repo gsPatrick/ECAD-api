@@ -6,6 +6,10 @@ Define paths de armazenamento, configuracoes de banco de dados e logging.
 import logging
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Carrega variaveis de ambiente do arquivo .env
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Diretorios
