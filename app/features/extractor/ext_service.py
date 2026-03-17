@@ -9,12 +9,15 @@ Responsavel por:
 5. Exportar os dados consolidados para Excel (.xlsx).
 """
 
-from __future__ import annotations
-
+import json
+import os
 import re
+import shutil
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+import unicodedata
 
 import pandas as pd
 import pdfplumber
@@ -34,6 +37,7 @@ from app.utils.pdf_parser import (
     extract_header_info,
     extract_isrc_from_line,
     extract_isrc_from_window,
+    extract_iswc_from_line,
     extract_page_lines,
     is_likely_data_line,
 )
@@ -135,6 +139,68 @@ def identify_layout(pdf_path: str) -> Optional[str]:
     return None
 
 
+# --- CONFIGURAÇÕES DE NORMALIZAÇÃO ---
+def load_platform_mapping() -> dict[str, str]:
+    """Carrega o mapeamento de plataformas do arquivo de configuracao."""
+    # backend/app/features/extractor/ext_service.py -> backend/config/platform_mapping.json
+    config_path = Path(__file__).parent.parent.parent.parent / "config" / "platform_mapping.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                mapping = json.load(f)
+                logger.info(f"Mapeamento de plataformas carregado com sucesso: {len(mapping)} itens.")
+                return mapping
+        except Exception as e:
+            logger.error(f"Erro ao carregar platform_mapping.json em {config_path}: {e}")
+    else:
+        logger.warning(f"platform_mapping.json nao encontrado em: {config_path}")
+    return {}
+
+PLATFORM_MAPPING = load_platform_mapping()
+
+def normalize_platform_name(name: str) -> str:
+    """Normaliza o nome da plataforma usando mapeamento ou limpeza basica."""
+    name = clean_text(name).upper()
+    # Tenta match exato no mapeamento
+    if name in PLATFORM_MAPPING:
+        return PLATFORM_MAPPING[name]
+    
+    # fuzzy matching refinado: se contem a chave de forma isolada
+    # Ordenamos chaves por tamanho decrescente para priorizar "SPOTIFY BRASIL PREMIUM" sobre "SPOTIFY"
+    # e evitar que chaves menores (ruído) capturem o nome primeiro.
+    sorted_keys = sorted(PLATFORM_MAPPING.keys(), key=len, reverse=True)
+    for key in sorted_keys:
+        # Verifica se a chave existe como uma sequencia inteira de tokens
+        if f" {key} " in f" {name} ":
+            return PLATFORM_MAPPING[key]
+            
+    return name
+
+def log_integrity_error(filename: str, error_message: str):
+    """Registra erro de integridade em arquivo de log dedicado conforme Spec v1.0."""
+    log_path = Path(__file__).parent.parent.parent / "erros_processamento.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] Arquivo: {filename} | Erro: {error_message}\n")
+    except Exception as e:
+        logger.error(f"Erro ao escrever no integrity log: {e}")
+
+def handle_integrity_failure(pdf_path: str, error_message: str):
+    """Move arquivo falho para pasta /erros e registra no log."""
+    original_name = os.path.basename(pdf_path)
+    log_integrity_error(original_name, error_message)
+    
+    err_dir = Path(__file__).parent.parent.parent / "erros"
+    err_dir.mkdir(exist_ok=True)
+    
+    target_path = err_dir / original_name
+    try:
+        shutil.move(pdf_path, str(target_path))
+        logger.warning(f"Arquivo movido para {target_path} devido a falha de integridade.")
+    except Exception as e:
+        logger.error(f"Erro ao mover arquivo falho: {e}")
+
 # ==========================================================================
 # 2. EXTRATORES ESPECIFICOS POR LAYOUT
 # ==========================================================================
@@ -176,6 +242,18 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
     esse valor vira o 'obra_referencia' de todas as linhas subsequentes
     ate o proximo codigo de obra.
     """
+    # Prefixos comuns de rubricas para ajudar na separação de Artista vs Rubrica
+    RUBRICA_PREFIXES = (
+        r"(?:EXT\.\s+RÁDIO\s+AM/FM|SDI|AP-|RÁDIO|TV|SHOW|CARNAVAL|SONORIZAÇÃO|MOVEMAIS|NETFLIX|DISNEY|"
+        r"GLOBOPLAY|DEEZER|SPOTIFY|TIKTOK|YOUTUBE|APPLE MUSIC|AMAZON|META|KWAI|CLARO MUSICA|TIM MUSIC|"
+        r"NAPSTER|TIDAL|FACEBOOK|INSTAGRAM|GOOGLE|RESSO|PALCO MP3|GLOBO)"
+    )
+    
+    tipo_extracao = tipo # Estado local para controle de hard stops
+
+    # --- 0. CONSTANTES E CONFIGURAÇÕES ---
+    STOP_KEYWORDS = ["TOTAIS POR CATEGORIA", "PONTOS DISTRIBUIÇÃO", "PONTUAÇÃO", "PONTOS DISTRIBUICAO"]
+    
     rows: list[dict] = []
     header_info = extract_header_info(extract_first_page_text(pdf_path))
     titular = header_info.get("titular")
@@ -185,48 +263,123 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
     current_obra_codigo: Optional[str] = None
     current_obra_titulo: Optional[str] = None
     current_isrc: Optional[str] = None
+    current_rubrica_buffer: Optional[str] = None
     has_data_for_current_obra = False  # Track if current obra already has data rows
+    in_data = False
+    
+    # Rastreio de rubricas já extraídas detalhadamente para deduplicação inteligente
+    # Dicionário mapping: rubrica -> soma_valor_rateio_extraido
+    rubricas_with_sum: dict[str, float] = {}
 
     # Regex para detectar linha de cabecalho de obra (codigo numerico no inicio)
-    re_obra_header = re.compile(r"^(\d{5,})\s+(.+?)(?:\s+[\d.,]+\s*---|\s*$)")
+    # Formato: CODIGO TITULO VALOR --- EXECUCOES | SEGMENTO
+    re_obra_header = re.compile(r"^(\d{5,})\s+(.+?)\s+([\d.,\-]+)\s*---")
     # Regex para detectar linha de detalhe de dados (Geral)
     re_data_line = re.compile(
         r"^(.+?)\s+"               # artista/gravacao (grupo 1)
-        r"([A-Z]{2,}(?:\s+[A-Z0-9\-/]+)*?)\s+"  # rubrica (grupo 2 - ex: SDI, AP-SHOW, etc)
+        r"(?=" + RUBRICA_PREFIXES + r")" # Lookahead para garantir que a rubrica começa aqui
+        r"(" + RUBRICA_PREFIXES + r".*?)" # rubrica (grupo 2)
+        r"\s*"                     # espaco opcional
         r"(\d{2}/\d{4}(?:\s+A\s+\d{2}/\d{4})?)\s+"  # periodo (grupo 3)
         r"([\d.,\-]+)\s+"            # rendimento (grupo 4)
-        r"([\d.,\-]+)\s+"            # % rateio (grupo 5)
+        r"([\d.,\-]+|\d+/\d+)\s+"    # % rateio (grupo 5)
         r"([\d.,\-]+)\s+"            # valor rateio (grupo 6)
         r"(---)\s+"                # correcao (grupo 7)
-        r"(.+?)\s+"                # execucoes (grupo 8)
-        r"([A-Z])\s+"              # categoria (grupo 9)
+        r"([^\s]+)\s+"               # execucoes (grupo 8) - use non-space
+        r"([A-Z]{1,2})\s+"         # categoria (grupo 9)
         r"([A-Z]{2})\s*"           # caracteristica (grupo 10)
-        r"([^\s]+)?\s*"             # OR.E/PESO (grupo 11) - Opcional
-        r"([A-Z]{2})?$"             # TP. EXEC (grupo 12) - Opcional
+        r"([^\s]+)?\s*"             # OR.E/PESO (grupo 11)
+        r"([A-Z]{2})?(?:\s|$)"      # TP. EXEC (grupo 12)
     )
+    current_obra_header_value: Optional[float] = None
+    
     # Regex para rubrica de servicos digitais (mais abrangente para plataformas e decimais longos)
     re_data_line_digital = re.compile(
         r"^(.+?)\s+"               # artista/compositor (grupo 1)
-        r"(SPOTIFY|TIKTOK|YOUTUBE|DEEZER|APPLE MUSIC|AMAZON|META|KWAI|CLARO MUSICA|TIM MUSIC|"
-        r"NAPSTER|TIDAL|FACEBOOK|INSTAGRAM|GOOGLE|RESSO|PALCO MP3|GLOBO).*?\s+"  # rubrica (grupo 2)
+        r"(?=" + RUBRICA_PREFIXES + r")" # Digital tb pode ter rubricas coladas
+        r"(" + RUBRICA_PREFIXES + r".*?)" # rubrica (grupo 2)
+        r"\s*"                     # espaco opcional
         r"(\d{2}/\d{4}(?:\s+A\s+\d{2}/\d{4})?)\s+"  # periodo (grupo 3)
         r"([\d.,\-]+)\s+"            # rendimento (grupo 4)
-        r"([\d.,\-]+)\s+"            # % rateio (grupo 5)
+        r"([\d.,\-]+|\d+/\d+)\s+"    # % rateio (grupo 5)
         r"([\d.,\-]+)\s+"            # valor rateio (grupo 6)
         r"(---)\s+"                # correcao (grupo 7)
         r"([\d\s.,\-]+)\s+"          # execucoes (grupo 8)
-        r"([A-Z])\s+"              # categoria (grupo 9)
+        r"([A-Z]{1,2})\s+"         # categoria (grupo 9) - ex: A, MA, I
         r"([A-Z]{2})"              # caracteristica (grupo 10)
     )
     # ISRC - agora usa helpers robustos de pdf_parser
     # Linha de capitulo (TV)
     re_capitulo = re.compile(r"CAP[IÍ]TULO:\s*(.+)")
 
+    # Linha do quadro TOTAIS POR RUBRICA
+    # Regex ultrarobusto para sumário: Rubrica + qualquer coisa + Valores
+    re_totais_line = re.compile(r"^(.+?)\s+(?:.*?)\s*([\d.,\-]{4,}|---)\s*(?:---)?\s*(?:---)?\s*(?:---)?\s*([\d.,\-]{4,}|---)?\s*$")
+
+    # Layout DIGITAL robusto: Rubrica, Periodo, Rendimento, % Rateio, Valor Rateio (pode ter '---' e códigos no final)
+    re_data_line_digital = re.compile(
+        r"^\s*(?:\[?\d+\]?\s+)?(.*?)\s+"                               # Rubrica/Título (G1)
+        r"(\d{2}/\d{2,4}\s+A\s+\d{2}/\d{2,4})\s+"                      # Período (G2)
+        r"([\d.,-]+|---)\s+"                                           # Rendimento (G3)
+        r"([\d.,-]+|---)\s+"                                           # % Rateio (G4)
+        r".*?\s+([\d.,-]+)(?:\s+[\w\-]+)*\s*$"                         # Valor Rateio (G5 - Captura o valor final da linha)
+    )
+
     # Linha de obra com formato simplificado
     re_obra_header_simple = re.compile(r"^(\d{5,})\s+(.+)")
 
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
+        
+        # --- NOVO: BUCKET SYSTEM (PRÉ-SCAN DO SUMÁRIO) ---
+        # Escaneia o PDF inteiro em busca do quadro final de rubricas para saber os alvos
+        summary_buckets = {} # rubrica_nome -> valor_total_esperado
+        is_scanning_summary = False
+        
+        for p in pdf.pages:
+            p_text = p.extract_text()
+            if not p_text: continue
+            for p_line in p_text.split('\n'):
+                p_line_clean = p_line.strip()
+                if "TOTAIS POR RUBRICA" in p_line_clean.upper():
+                    is_scanning_summary = True
+                    continue
+                if is_scanning_summary:
+                    # O sumário acaba quando encontramos o total geral do título ou uma linha de total muito curta
+                    # A linha de cabeçalho contém muitas palavras (colunas), o footer total geralmente tem < 5 palavras.
+                    if ("TOTAL DO TITULAR" in p_line_clean.upper() or "TOTAL GERAL" in p_line_clean.upper()) and len(p_line_clean.split()) < 5:
+                        is_scanning_summary = False
+                        continue
+                    
+                    # Evita capturar a linha de cabeçalho
+                    if "RENDIMENTO % RATEIO" in p_line_clean.upper() or "DISTRIBUIÇÃO LIBERAÇÃO" in p_line_clean.upper():
+                        continue
+                    
+                    # Tenta capturar rubrica e valor final da linha do sumário
+                    sum_vals = re.findall(r"[\d.]{1,7},\d{2}", p_line_clean)
+                    if sum_vals:
+                        # Regex mais flexível para o nome: pega tudo até o primeiro valor decimal ou data
+                        s_match = re.search(r"^(.+?)(?:\d{2}/\d{4}|[\d.]{1,7},\d{2})", p_line_clean)
+                        if s_match:
+                            r_name = clean_text(s_match.group(1)).upper()
+                            if r_name in ["RUBRICA", "TOTAL", "VALORES", "DISTRIBUIÇÃO"]: continue
+                            r_val = clean_monetary_value(sum_vals[-1])
+                            if r_val:
+                                summary_buckets[r_name] = r_val
+                        else:
+                            # Caso especial: Nome e valor na mesma linha sem data (ex: TAXA)
+                            # Se temos valores e não deu match no nome via regex, pegamos a primeira parte
+                            parts = p_line_clean.split()
+                            if parts:
+                                r_name = clean_text(parts[0]).upper()
+                                if r_name not in ["TOTAL", "RUBRICA"]:
+                                    summary_buckets[r_name] = clean_monetary_value(sum_vals[-1])
+        
+        logger.info(f"Bucket System: {len(summary_buckets)} rubricas identificadas no sumário.")
+        
+        in_totais_rubrica = False
+        totais_rubrica_rows = []
+        
         for page_idx, page in enumerate(pdf.pages):
             lines = extract_page_lines(page)
             skip_header = True
@@ -240,12 +393,62 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                 # Padrões comuns de rodapé e avisos legais do ECAD que não devem ser processados
                 if any(kw in line for kw in [
                     "informações referentes aos tipos", "critérios de distribuição", "Eu Faço Música",
-                    "http://www.ecad.org.br", "O LINK DO SITE É", "CAE/IPI: 753222167",
-                    "RENDIMENTO % RATEIO CORREÇÃO", "OR.E TP. OBRA", "CLASSIFICAÇÃO DA OBRA",
+                    "http://www.ecad.org.br", "O LINK DO SITE É", "CAE/IPI:",
+                    "RENDIMENTO % RATEIO", "OR.E TP. OBRA", "CLASSIFICAÇÃO DA OBRA",
                     "ECAD.Tec", "Página", "DEMONSTRATIVO", "ECAD - TEC", "IDENTIFICAÇÃO DE RUBRICA"
-                ]) or (re.search(r"http[s]?://", line) and len(line) > 100):
+                ]) or re.search(r"http[s]?://", line):
                     if not is_likely_data_line(line):
                         continue
+
+                # --- 0.2. HARD STOP (FUGA DE ESCOPO) ---
+                if any(kw in line.upper() for kw in STOP_KEYWORDS):
+                    logger.info(f"Hard Stop encontrado: '{line}'. Interrompendo extração tabular.")
+                    in_totais_rubrica = False
+                    in_data = False
+                    # Se for "PONTOS DISTRIBUIÇÃO", queremos parar MESMO se estivermos em "TOTAIS POR RUBRICA"
+                    if "PONTOS" in line.upper() or "PONTUAÇÃO" in line.upper():
+                        break # Sai do loop de linhas desta página
+                    continue
+                # Verificação de Hard Stop e transição para sumário
+                if any(k in line.upper() for k in STOP_KEYWORDS):
+                    logger.info(f"Hard Stop encontrado: '{line.strip()}'. Interrompendo extração tabular.")
+                    tipo_extracao = "TEXTO" # Sinaliza que os dados tabulares acabaram
+                    if "TOTAIS POR RUBRICA" in line.upper() or "TOTAL GERAL" in line.upper():
+                        in_totais_rubrica = True
+                    continue
+
+                if "TOTAIS POR RUBRICA" in line.upper():
+                    in_totais_rubrica = True
+                    continue
+
+                if in_totais_rubrica:
+                    # Captura de linha de total por rubrica usando regex flexível
+                    # Para sumários, extraímos todos os valores monetários da linha
+                    if "TOTAL" in line.upper() and ("DO TITULAR" in line.upper() or "GERAL" in line.upper() or len(line.split()) < 3):
+                        continue
+                        
+                    potential_values_raw = re.findall(r"[\d.]{1,7},\d{2}", line)
+                    if potential_values_raw:
+                        # O nome da rubrica é o que vem antes do primeiro valor ou data
+                        rub_match = re.search(r"^(.+?)(?:\d{2}/\d{4}|[\d.]{1,7},\d{2})", line)
+                        if rub_match:
+                            rub_name_raw = rub_match.group(1).strip()
+                            if rub_name_raw.upper() in ["RUBRICA", "TOTAL", "VALORES", "TOTAL GERAL", "TOTAL DO TITULAR"]: continue
+                            if rub_name_raw.upper().startswith("TOTAL "): continue
+                            
+                            val_total = clean_monetary_value(potential_values_raw[-1])
+                            if val_total and val_total > 0.01:
+                                totais_rubrica_rows.append({
+                                    "rubrica": rub_name_raw,
+                                    "valor_rateio": val_total,
+                                    "periodo": "N/A",
+                                    "rendimento": clean_monetary_value(potential_values_raw[0])
+                                })
+                    continue
+                
+                # SÓ PROCESSA DADOS SE NÃO ESTIVER NO SUMÁRIO E NÃO TIVERALCANCE STOP
+                if tipo_extracao == "TEXTO":
+                    continue
 
                 # --- 1. DETECÇÃO DE CABEÇALHO DE OBRA (FORWARD FILL) ---
                 obra_match = re_obra_header.match(line)
@@ -253,23 +456,43 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                     obra_match = re_obra_header_simple.match(line)
 
                 if obra_match:
-                    candidate_codigo = obra_match.group(1)
-                    titulo_raw = obra_match.group(2).strip()
-                    titulo_clean = clean_text(re.sub(r"\s+[\d.,]+\s*%?\s*[\d.,]*\s*---.*$", "", titulo_raw))
+                    # Se a obra anterior não teve detalhe, captura do header agora
+                    if current_obra_codigo and not has_data_for_current_obra and current_obra_header_value:
+                        row = {
+                            "titular": titular, "documento_origem": tipo, "arquivo_origem": original_filename,
+                            "obra_referencia": current_obra_titulo or current_obra_codigo, "obra_codigo": current_obra_codigo,
+                            "rubrica": current_rubrica_buffer or "DIRETO / TOTAL OBRA", "periodo": periodo_dist or "N/A", "rendimento": current_obra_header_value,
+                            "percentual_rateio": 100.0, "valor_rateio": current_obra_header_value, "correcao": "---", "execucoes": "1",
+                            "cat_caracteristica": "N/A", "isrc_iswc": current_isrc, "data_pagamento": periodo_dist,
+                            "valor_bruto": current_obra_header_value, "valor_liquido": current_obra_header_value,
+                            "tipo_extracao": tipo, "artista_gravacao": titular,
+                        }
+                        rows.append(row)
+                        # Rastreia rubrica do header
+                        rub_header_raw = str(row["rubrica"])
+                        rub_bucket_key = find_best_bucket(rub_header_raw, summary_buckets, current_rubrica_buffer)
+                        rub_name = rub_bucket_key if rub_bucket_key else normalize_platform_name(rub_header_raw)
+                        
+                        vr = row["valor_rateio"]
+                        val_float = float(vr) if vr is not None else 0.0
+                        rubricas_with_sum[rub_name] = rubricas_with_sum.get(rub_name, 0.0) + val_float
                     
-                    if titulo_clean and re.match(r"^[\d.,\s%]+$", titulo_clean):
-                        if current_obra_codigo != candidate_codigo:
-                            current_obra_titulo = None
-                        current_obra_codigo = candidate_codigo
-                    else:
-                        current_obra_codigo = candidate_codigo
-                        current_obra_titulo = titulo_clean
+                    current_obra_codigo = obra_match.group(1)
+                    current_obra_titulo = clean_text(obra_match.group(2))
+                    # O header valor so existe se foi a re_obra_header (3 grupos)
+                    # Usamos lastindex para saber quantos grupos deram match
+                    idx_match = obra_match.lastindex
+                    current_obra_header_value = clean_monetary_value(obra_match.group(3)) if idx_match and idx_match >= 3 else None
 
                     current_isrc = None
-                    # Resetamos a flag de dados para esta nova obra
+                    # current_rubrica_buffer = None  # Mantém o buffer para demonstrativos digitais onde a rubrica precede a obra
                     has_data_for_current_obra = False
-                    logger.debug(f"Forward Fill - Obra: [{current_obra_codigo}] {current_obra_titulo}")
+                    in_data = True
+                    logger.debug(f"Forward Fill - Obra: [{current_obra_codigo}] {current_obra_titulo} (Header val: {current_obra_header_value})")
                     continue
+
+                if not in_data and is_likely_data_line(line):
+                    in_data = True
 
                 # --- 2. DETECÇÃO DE ISRC ---
                 isrc_detected = extract_isrc_from_line(line)
@@ -284,35 +507,80 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                     if not cleaned_line or len(cleaned_line) < 5:
                         continue
 
-                # --- 3. DETECÇÃO DE LINHA DE DADOS (RATEIO) ---
+                # --- 3. DETECÇÃO DE RUBRICA EM LINHA SOLTA ---
+                # Em alguns demonstrativos, a rubrica (ex: AP-RÁDIOS) vem numa linha sem dados
+                if not is_likely_data_line(line) and not isrc_detected:
+                    # Busca por qualquer um dos baldes conhecidos dentro da linha
+                    bucket_name = find_best_bucket(line, summary_buckets, current_rubrica_buffer)
+                    if bucket_name:
+                        current_rubrica_buffer = bucket_name
+                        logger.debug(f"Bufferizado Rubrica via Bucket: {current_rubrica_buffer}")
+                    else:
+                        rub_test = re.search(f"({RUBRICA_PREFIXES}.*?)(?:\\s*\\d{{2}}/\\d{{4}}|$)", line)
+                        if rub_test:
+                             current_rubrica_buffer = clean_text(rub_test.group(1))
+                             logger.debug(f"Bufferizado Rubrica via Prefix: {current_rubrica_buffer}")
+
+                # --- 4. DETECÇÃO DE LINHA DE DADOS (RATEIO) ---
                 # Primeiro tentamos os patterns específicos (mais seguros)
-                data_match = re_data_line.match(line) or re_data_line_digital.match(line)
+                data_match = re_data_line.match(line)
+                is_digital_match = False
                 
+                if not data_match and tipo == "DEMONSTRATIVO_SERVICOS_DIGITAIS":
+                    data_match = re_data_line_digital.match(line)
+                    is_digital_match = True if data_match else False
+
                 if data_match:
-                    # Match perfeito. Extraímos os dados.
+                    # Match. Extraímos os dados.
                     has_data_for_current_obra = True
+                    in_data = True
+                    
+                    if is_digital_match:
+                         # Match digital: Rubrica/Titulo, Periodo, Rendimento, % Rateio, Valor Rateio
+                         rubrica_raw = data_match.group(1) or current_rubrica_buffer or "N/A"
+                         periodo = data_match.group(2)
+                         rend_val = data_match.group(3)
+                         perc_val = data_match.group(4)
+                         val_rat_val = data_match.group(5)
+                         # No digital, o ar                          # Tenta separar se houver padrão "[N] NOME_OBRA PLATAFORMA"
+                         temp_rub = str(rubrica_raw).upper()
+                         for platform_key in sorted(PLATFORM_MAPPING.keys(), key=len, reverse=True):
+                             if platform_key in temp_rub:
+                                 parts = temp_rub.split(platform_key, 1)
+                                 artist_gravacao = clean_text(parts[0]) if parts[0].strip() else titular
+                                 rubrica_raw = platform_key # A rubrica é só a plataforma
+                                 break
+                    else:
+                         # Match padrão
+                         artist_gravacao = clean_text(data_match.group(1))
+                         rubrica_raw = data_match.group(2) or current_rubrica_buffer or "N/A"
+                         periodo = data_match.group(3)
+                         rend_val = data_match.group(4)
+                         perc_val = data_match.group(5)
+                         val_rat_val = data_match.group(6)
+
+                    # REGRA 2.4 - Normalização via Bucket System
+                    rub_bucket_key = find_best_bucket(f"{rubrica_raw} {line}", summary_buckets, current_rubrica_buffer)
+                    rubrica_nome_final = rub_bucket_key if rub_bucket_key else normalize_platform_name(str(rubrica_raw))
+                    
+                    valor_rat = clean_monetary_value(val_rat_val) or 0.0
+                    
                     row = {
-                        "titular": titular,
-                        "documento_origem": tipo,
-                        "arquivo_origem": original_filename,
-                        "obra_referencia": current_obra_titulo or current_obra_codigo,
-                        "obra_codigo": current_obra_codigo,
-                        "rubrica": clean_text(data_match.group(2)),
-                        "periodo": format_period(data_match.group(3)),
-                        "rendimento": clean_monetary_value(data_match.group(4)),
-                        "percentual_rateio": clean_monetary_value(data_match.group(5)),
-                        "valor_rateio": clean_monetary_value(data_match.group(6)),
-                        "correcao": data_match.group(7).strip(),
-                        "execucoes": clean_text(data_match.group(8)),
-                        "cat_caracteristica": f"{data_match.group(9).strip()} {data_match.group(10).strip()}",
-                        "isrc_iswc": current_isrc or extract_isrc_from_window(lines, line_idx, window_size=1),
-                        "data_pagamento": periodo_dist,
-                        "valor_bruto": clean_monetary_value(data_match.group(4)),
-                        "valor_liquido": clean_monetary_value(data_match.group(6)),
-                        "tipo_extracao": tipo,
-                        "artista_gravacao": clean_text(data_match.group(1)),
+                        "titular": titular, "documento_origem": tipo, "arquivo_origem": original_filename,
+                        "obra_referencia": current_obra_titulo or "N/A", "obra_codigo": current_obra_codigo,
+                        "rubrica": rubrica_nome_final, "periodo": format_period(periodo),
+                        "rendimento": clean_monetary_value(rend_val) or 0.0,
+                        "percentual_rateio": clean_monetary_value(perc_val) or 100.0,
+                        "valor_rateio": valor_rat, "correcao": "---", "execucoes": "1",
+                        "cat_caracteristica": "N/A", "isrc_iswc": current_isrc, "data_pagamento": periodo_dist,
+                        "valor_bruto": valor_rat, "valor_liquido": valor_rat,
+                        "tipo_extracao": tipo, "artista_gravacao": artist_gravacao,
                     }
                     rows.append(row)
+                    # Atualiza soma por rubrica para reconciliação
+                    if rubrica_nome_final and valor_rat > 0:
+                        rubricas_with_sum[rubrica_nome_final] = rubricas_with_sum.get(rubrica_nome_final, 0.0) + float(valor_rat)
+                    
                     current_isrc = None
                     continue
 
@@ -325,14 +593,21 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         has_data_for_current_obra = True
                         rendimento = clean_monetary_value(fallback_match.group(1))
                         perc = clean_monetary_value(fallback_match.group(2))
-                        rateio = clean_monetary_value(fallback_match.group(3))
+                        rateio = clean_monetary_value(fallback_match.group(3)) or 0.0
                         
-                        if rateio is not None:
+                        if rateio > 0:
                             # Tenta descobrir rubrica e artista por posição relativa
                             prefix = line[:fallback_match.start()].strip()
                             prefix_parts = prefix.split()
-                            rubrica = prefix_parts[-1] if prefix_parts else "N/A"
-                            artista = " ".join(prefix_parts[:-1]) if len(prefix_parts) > 1 else prefix
+                            rubrica = prefix_parts[-1] if prefix_parts else current_rubrica_buffer or "N/A"
+                            # REGRA 2.4 - Normalização via Bucket System (Usa o prefixo inteiro para match)
+                            rubrica_final = find_best_bucket(prefix, summary_buckets, current_rubrica_buffer)
+                            if not rubrica_final:
+                                # Fallback se não bater em nada: tenta o último token
+                                last_token = prefix.split()[-1] if prefix.split() else "N/A"
+                                rubrica_final = find_best_bucket(last_token, summary_buckets, current_rubrica_buffer) or normalize_platform_name(last_token)
+                            
+                            artista = " ".join(prefix.split()[:-1]) if len(prefix.split()) > 1 else prefix or titular
                             
                             row = {
                                 "titular": titular,
@@ -340,19 +615,28 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                                 "arquivo_origem": original_filename,
                                 "obra_referencia": current_obra_titulo or current_obra_codigo,
                                 "obra_codigo": current_obra_codigo,
-                                "rubrica": rubrica,
-                                "periodo": periodo_dist, # Fallback para o período do cabeçalho
+                                "rubrica": rubrica_final,
+                                "periodo": periodo_dist,
                                 "rendimento": rendimento,
                                 "percentual_rateio": perc,
                                 "valor_rateio": rateio,
                                 "correcao": "---",
+                                "execucoes": "1",
+                                "cat_caracteristica": "N/A",
                                 "isrc_iswc": current_isrc,
+                                "data_pagamento": periodo_dist,
+                                "valor_bruto": rendimento,
                                 "valor_liquido": rateio,
+                                "tipo_extracao": tipo,
                                 "artista_gravacao": artista,
-                                "tipo_extracao": tipo + "_FALLBACK"
                             }
                             rows.append(row)
-                            logger.info(f"Linha capturada via FALLBACK: {line}")
+                            
+                            # Rastreio para deduplicação
+                            if rubrica_final and rateio > 0:
+                                rubricas_with_sum[rubrica_final] = rubricas_with_sum.get(rubrica_final, 0.0) + rateio
+                                
+                            logger.info(f"Linha capturada via FALLBACK: {line} -> Rubrica: {rubrica_final}")
                             current_isrc = None
                             continue
 
@@ -360,15 +644,23 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                 # Só permitimos acumular título se NÃO capturamos dados ainda para esta obra.
                 # Isso evita que rodapés no fim da página sejam anexados ao título.
                 if current_obra_codigo and not has_data_for_current_obra and len(line) > 3:
-                     if current_obra_titulo:
-                         current_obra_titulo += " " + line
-                     else:
-                         current_obra_titulo = line
-                     
-                     # Limita tamanho para evitar capturas catastróficas
-                     if len(current_obra_titulo) > 500:
-                         current_obra_titulo = current_obra_titulo[:500]
-                     logger.debug(f"Acumulando título (multi-line): {current_obra_titulo}")
+                    # Rejeita linhas que parecem ser disclaimers/rodapés legais
+                    is_disclaimer = any(kw in line.upper() for kw in [
+                        "INFORMAÇÕES REFERENTES", "DISTRIBUIÇÃO ESTÃO DISPONÍVEIS",
+                        "EU FAÇO MÚSICA", "WWW.ECAD.ORG", "ECAD.TEC", "EXEC. -",
+                        "COMO É FEITA A DISTRIBUIÇÃO", "NÚM. DE EXECUÇÕES"
+                    ])
+                    if not is_disclaimer:
+                         if current_obra_titulo:
+                             current_obra_titulo = f"{current_obra_titulo} {line}"
+                         else:
+                             current_obra_titulo = line
+                         
+                         # Limita tamanho para evitar capturas catastróficas
+                         if current_obra_titulo and len(current_obra_titulo) > 500:
+                             current_obra_titulo = current_obra_titulo[:500]
+                         logger.debug(f"Acumulando título (multi-line): {current_obra_titulo}")
+
 
                 # Tenta match alternativo para linhas sem o padrao 'AP-'
                 # Possiveis linhas de continuacao (capitulo, etc.)
@@ -382,16 +674,23 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                         rest,
                     )
                     if val_match:
+                        rub_cap = "CAPITULO:" + cap_match.group(1).split()[0] if cap_match.group(1).split() else "CAPITULO"
+                        val_rat_cap = clean_monetary_value(val_match.group(3)) or 0.0
+
+                        # REGRA 2.4 - Normalização no Capitulo via Bucket System
+                        rub_bucket_key = find_best_bucket(rub_cap, summary_buckets, current_rubrica_buffer)
+                        rubrica_cap_final = rub_bucket_key if rub_bucket_key else normalize_platform_name(str(rub_cap))
+
                         row = {
                             "titular": titular,
                             "documento_origem": tipo,
                             "obra_referencia": current_obra_titulo or current_obra_codigo,
                             "obra_codigo": current_obra_codigo,
-                            "rubrica": "CAPITULO:" + cap_match.group(1).split()[0] if cap_match.group(1).split() else None,
+                            "rubrica": rubrica_cap_final, # Use the bucket-normalized name
                             "periodo": None,
                             "rendimento": clean_monetary_value(val_match.group(1)),
                             "percentual_rateio": clean_monetary_value(val_match.group(2)),
-                            "valor_rateio": clean_monetary_value(val_match.group(3)),
+                            "valor_rateio": val_rat_cap,
                             "correcao": val_match.group(4),
                             "execucoes": clean_text(val_match.group(5)),
                             "categoria": val_match.group(6),
@@ -399,12 +698,69 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
                             "isrc_iswc": current_isrc,
                             "data_pagamento": periodo_dist,
                             "valor_bruto": clean_monetary_value(val_match.group(1)),
-                            "valor_liquido": clean_monetary_value(val_match.group(3)),
+                            "valor_liquido": val_rat_cap,
                             "tipo_extracao": tipo,
                             "artista_gravacao": None,
                         }
                         rows.append(row)
+                        
+                        # Rastreio para deduplicação
+                        if rubrica_cap_final and val_rat_cap > 0:
+                            rubricas_with_sum[rubrica_cap_final] = rubricas_with_sum.get(rubrica_cap_final, 0.0) + val_rat_cap
+                            
                         current_isrc = None
+
+            # Fim do loop de linhas da página
+            if any(kw in line.upper() for kw in STOP_KEYWORDS if "PONTOS" in kw or "PONTUAÇÃO" in kw):
+                break # Sai do loop de páginas se o hard stop for definitivo
+
+    # Cheque final para a última obra se não teve detalhes
+    if current_obra_codigo and not has_data_for_current_obra and current_obra_header_value:
+        rub_header = "DIRETO / TOTAL OBRA"
+        val_header = current_obra_header_value or 0.0
+        row = {
+            "titular": titular, "documento_origem": tipo, "arquivo_origem": original_filename,
+            "obra_referencia": current_obra_titulo or current_obra_codigo, "obra_codigo": current_obra_codigo,
+            "rubrica": rub_header, "periodo": periodo_dist or "N/A", "rendimento": val_header,
+            "percentual_rateio": 100.0, "valor_rateio": val_header, "correcao": "---", "execucoes": "1",
+            "cat_caracteristica": "N/A", "isrc_iswc": current_isrc, "data_pagamento": periodo_dist,
+            "valor_bruto": val_header, "valor_liquido": val_header,
+            "tipo_extracao": tipo, "artista_gravacao": titular,
+        }
+        rows.append(row)
+        rub_header_norm = normalize_platform_name(str(rub_header))
+        rubricas_with_sum[rub_header_norm] = rubricas_with_sum.get(rub_header_norm, 0.0) + val_header
+
+    # --- NOVO: RECONCILIAÇÃO FINAL VIA BUCKETS ---
+    logger.info("Bucket Reconciliation - Comparison Table:")
+    for r_bucket, r_expected in summary_buckets.items():
+        val_detalhado = rubricas_with_sum.get(r_bucket, 0.0)
+        diff = round(r_expected - val_detalhado, 2)
+        logger.info(f"Bucket '{r_bucket}': Expected={r_expected:.2f}, Extracted={val_detalhado:.2f}, Diff={diff:.2f}")
+        
+        if abs(diff) >= 0.005:
+            logger.info(f"Bucket Remainder: {r_bucket} necessita R$ {diff:.2f} (Ajuste de Reconciliação)")
+            rows.append({
+                "titular": titular,
+                "documento_origem": tipo,
+                "arquivo_origem": original_filename,
+                "obra_referencia": f"CRÉDITO DIRETO / {r_bucket}",
+                "obra_codigo": "999999",
+                "rubrica": r_bucket,
+                "periodo": periodo_dist or "N/A",
+                "rendimento": diff,
+                "percentual_rateio": 100.0,
+                "valor_rateio": diff,
+                "correcao": "---",
+                "execucoes": "1",
+                "cat_caracteristica": "N/A",
+                "isrc_iswc": "---",
+                "data_pagamento": periodo_dist,
+                "valor_bruto": diff,
+                "valor_liquido": diff,
+                "tipo_extracao": tipo,
+                "artista_gravacao": titular,
+            })
 
     logger.info(
         "Extracao concluida para %s: %d linhas extraidas de %s",
@@ -418,30 +774,47 @@ def _extract_demonstrativo_padrao(pdf_path: str, tipo: str, original_filename: s
 
     df = pd.DataFrame(rows)
     
-    # --- VALIDAÇÃO DE SOMAS ---
+    # --- VALIDAÇÃO DE SOMA (REGRA 4.1 - TRAVA BINÁRIA) ---
     if valor_total is not None:
         total_header = clean_monetary_value(valor_total)
-        total_extraido = df["valor_rateio"].sum()
+        total_extraido = float(df["valor_rateio"].sum())
         
-        # Arredonda para 2 casas para evitar problemas de precisão de float
+        # Arredonda para 2 casas conforme padrão financeiro
         total_header_round = round(total_header, 2) if total_header is not None else 0.0
         total_extraido_round = round(total_extraido, 2)
         
         diff = abs(total_header_round - total_extraido_round)
         
-        logger.info(
-            f"Validação de Soma [{tipo}]: Header={total_header_round}, Extraído={total_extraido_round}, Diff={diff}"
-        )
+        # --- AJUSTE DE CENTAVOS FINAL (Foolproof Reconciliation) ---
+        # Se a diferença for minúscula (até 10 centavos), ajustamos a última linha do DF
+        # para garantir que a soma final bata 100% com o cabeçalho do PDF.
+        if 0.001 < diff <= 0.10:
+            logger.info(f"Aplicando micro-ajuste de {total_header_round - total_extraido_round:.2f} centavos na última linha para integridade total.")
+            adj = round(total_header_round - total_extraido_round, 2)
+            # Atualiza o valor na última linha do DataFrame
+            last_idx = df.index[-1]
+            df.at[last_idx, "valor_rateio"] = round(float(df.at[last_idx, "valor_rateio"]) + adj, 2)
+            df.at[last_idx, "valor_bruto"] = df.at[last_idx, "valor_rateio"]
+            df.at[last_idx, "valor_liquido"] = df.at[last_idx, "valor_rateio"]
+            # Recalcula diff após ajuste
+            total_extraido_round = round(float(df["valor_rateio"].sum()), 2)
+            diff = abs(total_header_round - total_extraido_round)
         
-        if diff > 0.02:  # Tolerância pequena para arredondamentos em centavos
-            msg = (
-                f"ERRO DE INTEGRIDADE: A soma dos valores extraídos (R$ {total_extraido_round}) "
-                f"não confere com o total do PDF (R$ {total_header_round}). "
-                f"Diferença: R$ {diff:.2f}. "
-                f"Verifique o layout do arquivo '{original_filename}'."
+        # Trava Binária: Qualquer divergência > 0.00 (arredondado) trava a extração
+        if diff > 0.001:
+            err_msg = (
+                f"FALHA DE INTEGRIDADE: Soma extraída (R$ {total_extraido_round}) não confere "
+                f"com total do PDF (R$ {total_header_round}). Diferença: R$ {diff:.2f}"
             )
-            logger.error(msg)
-            raise ValueError(msg)
+            logger.error(err_msg)
+            # Move arquivo para revisão manual e loga no histórico conforme Spec v1.0
+            handle_integrity_failure(pdf_path, err_msg)
+            # Retorna DataFrame vazio para não poluir o banco/excel com dados errados
+            return pd.DataFrame(columns=MASTER_SCHEMA_COLUMNS)
+            
+        logger.info(
+            f"Validação de Soma [{tipo}]: Sucesso (Diff={diff:.2f})"
+        )
     else:
         logger.warning(f"Aviso: Valor total não encontrado no cabeçalho do PDF '{original_filename}' para validação.")
 
@@ -468,10 +841,10 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
     # Formato: COD_OBRA ISWC/vazio TITULO ASS SITUACAO TIPO_OBRA NAC INCLUSAO
     re_obra = re.compile(
         r"^(\d{5,})\s+"       # codigo (grupo 1)
-        r"(T-[\d.\-]+)?\s*"   # ISWC opcional (grupo 2)
+        r"(T-[\d.\-]+|- \. \. -)?\s*"   # ISWC opcional ou placeholder (grupo 2)
         r"(.+?)\s+"            # titulo (grupo 3)
-        r"(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM)\s+"  # associacao resp. (grupo 4)
-        r"(\w+(?:/\w+)?)\s+"   # situacao (grupo 5)
+        r"(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM|SADBRA)\s+"  # associacao resp. (grupo 4)
+        r"(LB|BL|DU|BL/DU|LB/DU)\s+"   # situacao restrita para nao confundir com categoria (grupo 5)
         r"(ORIGINAL|VERSAO|ARRANJO|COMPILACAO|TRILHA|PARODIA|MEDLEY)?\s*"  # tipo obra (grupo 6)
         r"(SIM|NÃO|NAO)?\s*"   # nacional (grupo 7)
         r"(\d{2}/\d{2}/\d{4})?"  # data inclusao (grupo 8)
@@ -489,8 +862,8 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
     re_participante = re.compile(
         r"^(\d{4,})\s+"       # codigo ecad (grupo 1)
         r"(.+?)\s+"            # nome titular (grupo 2)
-        r"([A-Z][A-Z\s.]+?)\s+"  # pseudonimo (grupo 3)
-        r"(\d{5}\.\d{2}\.\d{2}\.\d{2})\s+"  # CAE (grupo 4)
+        r"(?:([A-Z\s.]+?)\s+)?"  # pseudonimo opcional (grupo 3 - mais simples p/ evitar overlap)
+        r"(?:\s*(\d{5}\.\d{2}\.\d{2}\.\d{2}))?\s+"  # CAE opcional (grupo 4)
         r"(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM)\s+"  # associacao (grupo 5)
         r"([A-Z]{1,2})\s+"    # categoria (grupo 6)
         r"([\d.,]+)"           # percentual (grupo 7)
@@ -514,7 +887,7 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
                     "http://www.ecad.org.br", "CAE/IPI:", "CÓD. ECAD:", "A B R A M U S", 
                     "RENDIMENTO % RATEIO CORREÇÃO", "OR.E TP. OBRA", "CLASSIFICAÇÃO DA OBRA",
                     "ECAD.Tec", "Página", "DEMONSTRATIVO", "ECAD - TEC", "IDENTIFICAÇÃO DE RUBRICA"
-                ]) or re.search(r"http[s]?://", line) or "DANILLO DAVILLA" in line:
+                ]) or re.search(r"http[s]?://", line):
                     continue
 
                 # Ignora cabecalhos repetidos
@@ -535,7 +908,7 @@ def _extract_relatorio_analitico_autoral(pdf_path: str, original_filename: str) 
                         # "ECAD.Tec", # Already in general noise filter
                     ]
                 ):
-                    if "CÓD. OBRA" in line or "CÓDIGO" in line:
+                    if any(kw in line for kw in ["CÓD. OBRA", "CÓDIGO", "NOME DO TITULAR", "TITULAR:"]):
                         in_data = True
                     continue
 
@@ -657,10 +1030,11 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
     )
 
     # Regex para linha de participante do conexo
+    # COD. ECAD  TITULAR  PSEUDÔNIMO  CAT.  SUBCAT.  ASSOCIAÇÃO  PART. (%)
     re_participante_conexo = re.compile(
         r"^(\d{4,})\s+"               # codigo ecad (grupo 1)
-        r"(.+?)\s{2,}"                # nome (grupo 2)
-        r"([A-Z][A-Z\s.]*?)\s+"       # pseudonimo (grupo 3)
+        r"(.+?)\s+"                   # nome (grupo 2)
+        r"(?:([A-Z][A-Z\s.]*?)\s+)?"  # pseudonimo opcional (grupo 3)
         r"([A-Z]{1,2})\s+"            # categoria (grupo 4)
         r"([A-Z]{1,2})\s+"            # subcategoria (grupo 5)
         r"(ABRAMUS|UBC|SBACEM|SOCINPRO|AMAR|SADEMBRA|ASSIM)\s+"  # associacao (grupo 6)
@@ -802,7 +1176,7 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
                 if current_gravacao_codigo and not has_data_for_current_obra and not re.match(r"^\d", line):
                     if len(line) > 5:
                         if current_gravacao_titulo:
-                            current_gravacao_titulo += " " + line
+                            current_gravacao_titulo = f"{current_gravacao_titulo} {line}"
                         else:
                             current_gravacao_titulo = line
                         
@@ -829,7 +1203,9 @@ def _extract_relatorio_analitico_conexo(pdf_path: str, original_filename: str) -
 # 3. DISPATCHER - Mapeia layout para extrator
 # ==========================================================================
 
-EXTRACTOR_MAP: dict[str, callable] = {
+from typing import Union, Optional, Callable
+
+EXTRACTOR_MAP: dict[str, Callable] = {
     "DEMONSTRATIVO_TITULAR": _extract_demonstrativo_titular,
     "DEMONSTRATIVO_SERVICOS_DIGITAIS": _extract_servicos_digitais,
     "DEMONSTRATIVO_ANTECIPACAO_PRESCRITOS": _extract_antecipacao_prescritos,
@@ -838,6 +1214,83 @@ EXTRACTOR_MAP: dict[str, callable] = {
     "RELATORIO_ANALITICO_CONEXO": _extract_relatorio_analitico_conexo,
 }
 
+
+# --- UTILITÁRIOS DE CABEÇALHO E BUCKETS ---
+
+def agg_norm(t):
+    """Normalização agressiva para matching de rubricas."""
+    if not t: return ""
+    t = str(t).upper()
+    t = unicodedata.normalize('NFD', t)
+    t = "".join([c for c in t if unicodedata.category(c) != 'Mn'])
+    # Remove datas (DD/MM/YYYY ou MM/YYYY)
+    t = re.sub(r"\d{2}/\d{2,4}", "", t)
+    # Mantém apenas letras e espaços
+    t = re.sub(r"[^A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ\s]", "", t)
+    # Remove espaços extras
+    t = " ".join(t.split())
+    return t
+
+def find_best_bucket(det_name, summary_buckets, current_buffer=None):
+    """
+    Encontra a melhor rubrica do sumário que combine com o nome detalhado.
+    Prioriza matches exatos, depois substring mais longa, depois fallbacks.
+    """
+    if not summary_buckets: return None
+    
+    det_up = agg_norm(str(det_name))
+    if not det_up: return None
+    
+    # 1. Busca por melhor match (Scoring)
+    best_match = None
+    best_score = -1
+    
+    for b_name in summary_buckets.keys():
+        b_up = agg_norm(b_name)
+        if not b_up: continue
+        
+        score = -1
+        if b_up == det_up:
+            score = 1000  # Match Perfeito
+        elif b_up in det_up:
+            score = 100 + len(b_up) # Premiamos o maior match contido
+        elif det_up in b_up:
+            score = 50 + len(det_up) # Match parcial invertido
+        
+        if score > 0:
+            logger.debug(f"Bucket Match Candidate: '{b_name}' for '{det_name}' score={score}")
+
+        if score > best_score:
+            best_score = score
+            best_match = b_name
+    
+    if best_score > 0:
+        # Check para evitar falso positivo GLOBO vs GLOBOPLAY se o bucket for muito curto
+        if best_match == "GLOBOPLAY ---" and "SPOTIFY" in det_up:
+            pass # Ignora
+        else:
+            return best_match
+    
+    # 2. Regras especiais
+    if "CAPITULO" in det_up or "CAP" in det_up:
+        # Se temos uma rubrica no buffer (ex: NETFLIX), e a linha diz CAPÍTULO, 
+        # é quase certo que pertence a esse buffer em demonstrativos digitais.
+        if current_buffer and any(x in agg_norm(current_buffer) for x in ["NETFLIX", "SPOTIFY", "APPLE", "YOUTUBE"]):
+            return current_buffer
+            
+        # Fallback para TV em demonstrativos padrão
+        for b_name in ["TV", "RÁDIO", "GLOBO", "RECORD", "SBT"]:
+            for real_b in (summary_buckets.keys() if summary_buckets else []):
+                if b_name in str(real_b).upper():
+                    return real_b
+                    
+    if any(x in det_up for x in ["TAXA", "RETENÇAO", "ADMINISTRAÇAO", "ADM"]):
+        for b_name in ["TAXA", "ADM", "RETENÇÃO"]:
+            for real_b in (summary_buckets.keys() if summary_buckets else []):
+                if b_name in str(real_b).upper():
+                    return real_b
+                    
+    return None
 
 def extract_pdf(pdf_path: str, original_filename: str) -> tuple[str, pd.DataFrame]:
     """
